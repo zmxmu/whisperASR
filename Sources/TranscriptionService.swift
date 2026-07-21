@@ -12,9 +12,10 @@ final class TranscriptionService: @unchecked Sendable {
     }
 
     func shutdown() {
-        // Serialize with any in-flight whisper_full; if the process exits before
-        // this runs the OS reclaims the context anyway.
-        whisperQueue.async {
+        // App termination must wait for any in-flight whisper_full to finish.
+        // An asynchronous cleanup lets the process begin destroying ggml/Metal
+        // globals while inference is still using them, causing EXC_BAD_ACCESS.
+        whisperQueue.sync {
             if let ctx = self.ctx {
                 whisper_free(ctx)
                 self.ctx = nil
@@ -36,6 +37,7 @@ final class TranscriptionService: @unchecked Sendable {
                 let ctx: OpaquePointer
                 do {
                     ctx = try self.ensureModelLoaded()
+                    try self.validateLanguage(language, for: ctx)
                 } catch {
                     continuation.resume(throwing: error)
                     return
@@ -73,13 +75,18 @@ final class TranscriptionService: @unchecked Sendable {
                 let nSegments = whisper_full_n_segments(ctx)
                 var segments: [TranscriptionSegment] = []
                 var fullText = ""
+                let detected = self.detectedLanguage(in: ctx)
 
                 for i in 0..<nSegments {
                     let t0 = whisper_full_get_segment_t0(ctx, i)  // centiseconds (10ms units)
                     let t1 = whisper_full_get_segment_t1(ctx, i)
                     let text: String
                     if let cStr = whisper_full_get_segment_text(ctx, i) {
-                        text = String(cString: cStr)
+                        text = self.normalizedScript(
+                            String(cString: cStr),
+                            language: detected,
+                            translate: translate
+                        )
                     } else {
                         text = ""
                     }
@@ -90,13 +97,6 @@ final class TranscriptionService: @unchecked Sendable {
                         text: text
                     ))
                     fullText += text
-                }
-
-                // Whisper's auto-detected language for the audio.
-                var detected: String? = nil
-                let langId = whisper_full_lang_id(ctx)
-                if langId >= 0, let langPtr = whisper_lang_str(langId) {
-                    detected = String(cString: langPtr)
                 }
 
                 continuation.resume(returning: TranscriptionResult(
@@ -112,7 +112,7 @@ final class TranscriptionService: @unchecked Sendable {
 
     /// Transcribe raw 16kHz mono PCM Float32 samples directly (used for live transcription during recording).
     /// This reuses the already-loaded whisper model and runs on a background queue.
-    func transcribeChunk(samples: [Float]) async throws -> TranscriptionResult {
+    func transcribeChunk(samples: [Float], language: String? = nil) async throws -> TranscriptionResult {
         guard !samples.isEmpty else {
             return TranscriptionResult(text: "", segments: [])
         }
@@ -122,13 +122,17 @@ final class TranscriptionService: @unchecked Sendable {
                 let ctx: OpaquePointer
                 do {
                     ctx = try self.ensureModelLoaded()
+                    try self.validateLanguage(language, for: ctx)
                 } catch {
                     continuation.resume(throwing: error)
                     return
                 }
 
                 let liveThreads = min(4, max(1, Int32(ProcessInfo.processInfo.activeProcessorCount / 4)))
-                let (params, langCStr) = self.makeBaseParams(threadCount: liveThreads)
+                let (params, langCStr) = self.makeBaseParams(
+                    threadCount: liveThreads,
+                    language: language
+                )
                 defer { free(langCStr) }
 
                 let result = samples.withUnsafeBufferPointer { buf in
@@ -143,13 +147,14 @@ final class TranscriptionService: @unchecked Sendable {
                 let nSegments = whisper_full_n_segments(ctx)
                 var segments: [TranscriptionSegment] = []
                 var fullText = ""
+                let detected = self.detectedLanguage(in: ctx)
 
                 for i in 0..<nSegments {
                     let t0 = whisper_full_get_segment_t0(ctx, i)
                     let t1 = whisper_full_get_segment_t1(ctx, i)
                     let text: String
                     if let cStr = whisper_full_get_segment_text(ctx, i) {
-                        text = String(cString: cStr)
+                        text = self.normalizedScript(String(cString: cStr), language: detected)
                     } else {
                         text = ""
                     }
@@ -164,7 +169,8 @@ final class TranscriptionService: @unchecked Sendable {
 
                 continuation.resume(returning: TranscriptionResult(
                     text: fullText,
-                    segments: segments
+                    segments: segments,
+                    detectedLanguage: detected
                 ))
             }
         }
@@ -180,6 +186,32 @@ final class TranscriptionService: @unchecked Sendable {
 
     // MARK: - Params Configuration
 
+    private func validateLanguage(_ language: String?, for ctx: OpaquePointer) throws {
+        guard let language,
+              !language.isEmpty,
+              language != "auto",
+              language != "en",
+              whisper_is_multilingual(ctx) == 0 else { return }
+        throw TranscriptionError.processFailed(
+            "The selected model is English-only. Choose English or select a multilingual model."
+        )
+    }
+
+    private func detectedLanguage(in ctx: OpaquePointer) -> String? {
+        let langId = whisper_full_lang_id(ctx)
+        guard langId >= 0, let langPtr = whisper_lang_str(langId) else { return nil }
+        return String(cString: langPtr)
+    }
+
+    /// Normalize Chinese transcription to Simplified Chinese using ICU's
+    /// built-in script conversion. No character dictionary is maintained here.
+    private func normalizedScript(_ text: String,
+                                  language: String?,
+                                  translate: Bool = false) -> String {
+        guard !translate, language == "zh" else { return text }
+        return text.applyingTransform(StringTransform("Traditional-Simplified"), reverse: false) ?? text
+    }
+
     /// Create base whisper params. `language` nil/empty means auto-detect; when
     /// `translate` is true whisper translates the audio to English.
     /// Caller must free the returned C string pointer after whisper_full completes.
@@ -190,6 +222,10 @@ final class TranscriptionService: @unchecked Sendable {
         params.print_progress = false
         params.print_realtime = false
         params.print_timestamps = false
+        // Suppress the model's built-in non-speech tokens (music, noise, etc.)
+        // during decoding. This operates on token IDs, so it avoids maintaining
+        // a language-dependent list of strings such as "[Music]".
+        params.suppress_nst = true
         params.n_threads = threadCount ?? max(1, Int32(ProcessInfo.processInfo.activeProcessorCount / 2))
         params.translate = translate
 

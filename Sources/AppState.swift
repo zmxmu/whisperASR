@@ -294,10 +294,14 @@ class AppState {
         item.status = .transcribing
         item.progress = 0
         item.transcriptionStartTime = Date()
+        let recognitionLanguage = RecognitionLanguageMode.current.whisperLanguage
 
         Task.detached { [service] in
             do {
-                let result = try await service.transcribe(fileURL: item.fileURL) { progress in
+                let result = try await service.transcribe(
+                    fileURL: item.fileURL,
+                    language: recognitionLanguage
+                ) { progress in
                     Task { @MainActor in
                         item.progress = progress
                     }
@@ -332,6 +336,7 @@ class AppState {
         translationAuthPaused = false
         liveTranslationPaused = false
         isLiveTranscribing = true
+        let recognitionLanguage = RecognitionLanguageMode.current.whisperLanguage
 
         liveTranscriptionTask = Task { [weak self] in
             guard let self else { return }
@@ -428,7 +433,10 @@ class AppState {
                 let timeoutSeconds = max(60.0, chunkSeconds * 4.0)
                 do {
                     let result = try await Self.withTimeout(seconds: timeoutSeconds) {
-                        try await self.service.transcribeChunk(samples: chunk)
+                        try await self.service.transcribeChunk(
+                            samples: chunk,
+                            language: recognitionLanguage
+                        )
                     }
 
                     // Offset timestamps to match position in the full stream.

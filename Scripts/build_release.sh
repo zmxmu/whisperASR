@@ -192,7 +192,10 @@ ENTPLIST
     codesign --verify --deep --strict "$APP_BUNDLE"
     spctl --assess --type execute "$APP_BUNDLE" && echo "    Gatekeeper: OK" || echo "    Gatekeeper: not yet notarized (run notarytool to fix)"
 else
-    echo "==> Skipping code signing (set CODESIGN_IDENTITY to sign)"
+    echo "==> No Developer ID configured; applying ad-hoc signature..."
+    codesign --deep --force --sign - "$APP_BUNDLE"
+    codesign --verify --deep --strict "$APP_BUNDLE"
+    echo "    Ad-hoc signature: valid for local use (not notarized for distribution)"
 fi
 
 echo "==> Done! App bundle created at:"

@@ -149,30 +149,19 @@ struct RecordingView: View {
 
             if !appState.liveSegments.isEmpty {
                 ScrollViewReader { proxy in
-                    List {
-                        ForEach(Array(appState.liveSegments.enumerated()), id: \.offset) { index, segment in
-                            LiveSegmentRow(
-                                segment: segment,
-                                translation: index < appState.liveTranslatedSegments.count
-                                    ? appState.liveTranslatedSegments[index] : "",
-                                fontSize: fontSize,
-                                translationOnly: translationOnly
-                            )
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets(top: 3, leading: 12, bottom: 3, trailing: 12))
-                            .listRowBackground(Color.clear)
-                        }
+                    ScrollView {
+                        Text(liveTranscriptText)
+                            .font(fontSize.bodyFont)
+                            .foregroundStyle(.primary.opacity(0.85))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
 
                         Color.clear
                             .frame(height: 1)
                             .id("bottomAnchor")
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets())
-                            .listRowBackground(Color.clear)
                     }
-                    .listStyle(.plain)
-                    .scrollContentBackground(.hidden)
-                    .environment(\.defaultMinListRowHeight, 1)
                     .background(
                         ScrollPositionObserver(isAtBottom: $shouldAutoScroll)
                             .frame(width: 0, height: 0)
@@ -184,7 +173,6 @@ struct RecordingView: View {
                     .onChange(of: appState.liveTranslatedSegments) { _, _ in
                         deferredScrollToBottom(proxy: proxy)
                     }
-                    .overlay { WindowDragOverlay() }
                 }
             }
         }
@@ -205,6 +193,21 @@ struct RecordingView: View {
 
     // MARK: - Helpers
 
+    private var liveTranscriptText: String {
+        appState.liveSegments.enumerated().compactMap { index, segment in
+            let original = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let translation = index < appState.liveTranslatedSegments.count
+                ? appState.liveTranslatedSegments[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+
+            if translationOnly {
+                return translation.isEmpty ? nil : translation
+            }
+            return translation.isEmpty ? original : "\(original)\n\(translation)"
+        }
+        .joined(separator: "\n")
+    }
+
     private func errorBanner(message: String, tint: Color) -> some View {
         HStack(spacing: 6) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -220,7 +223,7 @@ struct RecordingView: View {
         .background(tint.opacity(0.12))
     }
 
-    /// Defer the actual scroll until the List finishes layout, and re-check
+    /// Defer the actual scroll until the ScrollView finishes layout, and re-check
     /// shouldAutoScroll inside the dispatch so a concurrent user scroll-up
     /// (which updates the flag synchronously via the observer) takes effect
     /// before we decide whether to snap back to the bottom.
@@ -275,6 +278,7 @@ private struct LiveSegmentRow: View, Equatable {
                 Text(segment.text.trimmingCharacters(in: .whitespaces))
                     .font(fontSize.bodyFont)
                     .foregroundStyle(.primary.opacity(0.85))
+                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if !translation.isEmpty {
@@ -282,6 +286,7 @@ private struct LiveSegmentRow: View, Equatable {
                     .font(translationOnly ? fontSize.bodyFont : fontSize.translationFont)
                     .foregroundStyle(Self.translationColor)
                     .italic(translationOnly ? false : true)
+                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }

@@ -31,6 +31,7 @@ enum BackupService {
         var transcriptFontSize: String?
         var selectedModelFile: String?
         var modelPath: String?
+        var recognitionLanguageMode: String?
         var targetLanguage: String?
         var translationEndpoint: String?
         var translationModel: String?
@@ -47,6 +48,7 @@ enum BackupService {
             transcriptFontSize: d.string(forKey: "transcriptFontSize"),
             selectedModelFile: d.string(forKey: "selectedModelFile"),
             modelPath: d.string(forKey: "modelPath"),
+            recognitionLanguageMode: d.string(forKey: RecognitionLanguageMode.defaultsKey),
             targetLanguage: d.string(forKey: "targetLanguage"),
             translationEndpoint: d.string(forKey: "translationEndpoint"),
             translationModel: d.string(forKey: "translationModel"),
@@ -93,6 +95,7 @@ enum BackupService {
         set(c.transcriptFontSize, "transcriptFontSize")
         set(c.selectedModelFile, "selectedModelFile")
         set(c.modelPath, "modelPath")
+        set(c.recognitionLanguageMode, RecognitionLanguageMode.defaultsKey)
         set(c.targetLanguage, "targetLanguage")
         set(c.translationEndpoint, "translationEndpoint")
         set(c.translationModel, "translationModel")

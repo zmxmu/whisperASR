@@ -150,6 +150,7 @@ xattr -cr /path/to/WhisperASR.app
 Open **Settings** (Cmd+,) to configure:
 
 - **Target Language** — choose a language to translate transcriptions into
+- **Spoken Language** — use automatic detection or guide the selected model for Mandarin, English, or Mandarin-English mixed speech
 - **OpenAI Translation API** — only the API key is required; endpoint defaults to OpenAI, model defaults to `gpt-4o-mini`. Any OpenAI-compatible endpoint (including local models) works.
 - **Speech Recognition Models** — download, select, or delete models; the selected model is used for all transcription
 - **Custom Model** — optional path to your own `ggml-*.bin` file, used when no downloaded model is selected
