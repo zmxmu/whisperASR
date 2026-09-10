@@ -7,8 +7,6 @@ struct RecordingView: View {
     @Environment(\.dismiss) var dismiss
     @State private var isAlwaysOnTop = false
     @State private var translationOnly = false
-    @AppStorage("transcriptFontSize") private var transcriptFontSizeRaw = TranscriptFontSize.normal.rawValue
-    private var fontSize: TranscriptFontSize { TranscriptFontSize(rawValue: transcriptFontSizeRaw) ?? .normal }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -32,12 +30,14 @@ struct RecordingView: View {
 
     // MARK: - Recording
 
+    // The transcript pane and the duration label are separate views so that a live-text
+    // update re-evaluates only the pane, and the 1 Hz duration tick only the label —
+    // neither re-runs this whole body (and the NSViewRepresentable update) every second.
     private var recordingContent: some View {
-        @Bindable var recorder = recorder
-        return VStack(spacing: 0) {
+        VStack(spacing: 0) {
             // Live transcription area (only shown if enabled)
             if appState.enableLiveTranscription {
-                liveTranscriptView
+                LiveTranscriptPane(translationOnly: translationOnly)
                 Divider()
             }
 
@@ -49,8 +49,7 @@ struct RecordingView: View {
                         .frame(width: 8, height: 8)
                         .shadow(color: .red.opacity(0.6), radius: 4)
                         .modifier(PulsingModifier())
-                    Text(formatDuration(recorder.recordingDuration))
-                        .font(.system(size: 13, weight: .light, design: .monospaced))
+                    RecordingDurationLabel()
                 }
 
                 Spacer()
@@ -124,9 +123,45 @@ struct RecordingView: View {
         }
     }
 
-    // MARK: - Live Transcript
+    // MARK: - Saving
 
-    private var liveTranscriptView: some View {
+    private var savingContent: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .scaleEffect(1.2)
+            Text("Saving recording...")
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Helpers
+
+    private func stopAndDismiss() {
+        Task {
+            await appState.finishRecording(recorder: recorder)
+            dismiss()
+        }
+    }
+
+    private func setWindowAlwaysOnTop(_ alwaysOnTop: Bool) {
+        NSApplication.shared.windows
+            .first { $0.title == "Recording" }?
+            .level = alwaysOnTop ? .floating : .normal
+    }
+}
+
+// MARK: - Live Transcript Pane
+
+/// Observes only the live-transcript state, so whisper updates re-evaluate this view alone.
+private struct LiveTranscriptPane: View {
+    @Environment(AppState.self) private var appState
+    @AppStorage("transcriptFontSize") private var transcriptFontSizeRaw = TranscriptFontSize.normal.rawValue
+    let translationOnly: Bool
+
+    private var fontSize: TranscriptFontSize { TranscriptFontSize(rawValue: transcriptFontSizeRaw) ?? .normal }
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let message = appState.liveError {
                 errorBanner(message: message, tint: .red)
@@ -154,25 +189,11 @@ struct RecordingView: View {
                     fontSize: fontSize,
                     translationOnly: translationOnly
                 )
-                .help("Drag to select across lines; ⌘C copies. Display updates pause while text is selected; recording continues. Click to resume.")
+                .help("Drag to select across lines; ⌘C copies. Earlier text stays selected while new text keeps arriving; a selection that includes the newest line pauses display updates until you click.")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-
-    // MARK: - Saving
-
-    private var savingContent: some View {
-        VStack(spacing: 12) {
-            ProgressView()
-                .scaleEffect(1.2)
-            Text("Saving recording...")
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // MARK: - Helpers
 
     private func errorBanner(message: String, tint: Color) -> some View {
         HStack(spacing: 6) {
@@ -188,28 +209,25 @@ struct RecordingView: View {
         .padding(.vertical, 6)
         .background(tint.opacity(0.12))
     }
+}
 
-    private func stopAndDismiss() {
-        Task {
-            await appState.finishRecording(recorder: recorder)
-            dismiss()
-        }
+// MARK: - Recording Duration Label
+
+/// Observes only `recordingDuration`, so the 1 Hz tick re-renders this label alone.
+private struct RecordingDurationLabel: View {
+    @Environment(AudioRecorder.self) private var recorder
+
+    var body: some View {
+        Text(Self.format(recorder.recordingDuration))
+            .font(.system(size: 13, weight: .light, design: .monospaced))
     }
 
-    private func setWindowAlwaysOnTop(_ alwaysOnTop: Bool) {
-        NSApplication.shared.windows
-            .first { $0.title == "Recording" }?
-            .level = alwaysOnTop ? .floating : .normal
-    }
-
-    private func formatDuration(_ duration: TimeInterval) -> String {
+    private static func format(_ duration: TimeInterval) -> String {
         let minutes = Int(duration) / 60
         let seconds = Int(duration) % 60
         return String(format: "%02d:%02d", minutes, seconds)
     }
-
 }
-
 
 // MARK: - Window Configurator
 
@@ -229,7 +247,6 @@ private struct WindowConfigurator: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { ConfigView() }
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
-
 
 // MARK: - Pulsing Animation
 

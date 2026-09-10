@@ -2,7 +2,9 @@ import SwiftUI
 import AppKit
 
 /// One selectable document. Stable paragraphs stay in NSTextStorage; only the changed
-/// suffix is replaced. Selecting text freezes presentation, not capture or inference.
+/// suffix is replaced. A selection inside the stable history survives updates untouched;
+/// only a selection that reaches into the changing tail pauses presentation (never capture
+/// or inference) until it is cleared.
 struct LiveTranscriptTextView: NSViewRepresentable {
     let segments: [TranscriptionSegment]
     let translations: [String]
@@ -36,6 +38,12 @@ struct LiveTranscriptTextView: NSViewRepresentable {
         text.textContainer?.widthTracksTextView = true
         text.textContainer?.containerSize = NSSize(width: scroll.contentSize.width, height: .greatestFiniteMagnitude)
         text.layoutManager?.allowsNonContiguousLayout = true
+        // Read-only transcript: no spelling/substitution/data-detector passes over hours of text.
+        text.enabledTextCheckingTypes = 0
+        text.isAutomaticDataDetectionEnabled = false
+        text.isAutomaticLinkDetectionEnabled = false
+        text.isContinuousSpellCheckingEnabled = false
+        text.isGrammarCheckingEnabled = false
         text.delegate = coordinator
         scroll.documentView = text
         coordinator.textView = text
@@ -78,12 +86,13 @@ struct LiveTranscriptTextView: NSViewRepresentable {
 
         func renderPending() {
             guard !applying, let text = textView, !text.isSelecting,
-                  text.selectedRanges.allSatisfy({ $0.rangeValue.length == 0 }),
                   let next = pending, let storage = text.textStorage else { return }
             let styleChanged = rendered?.fontSize != next.fontSize
                 || rendered?.translationOnly != next.translationOnly
             if let old = rendered, old.revision == next.revision, !styleChanged { return }
 
+            // Unchanged prefix: the stable history shares String storage with the previous
+            // snapshot, so these comparisons hit the identical-storage fast path.
             var first = 0
             if let old = rendered, !styleChanged {
                 let limit = min(old.segments.count, next.segments.count)
@@ -100,6 +109,13 @@ struct LiveTranscriptTextView: NSViewRepresentable {
                 }
             }
 
+            // Only text from `start` onward changes. A selection entirely before it is
+            // unaffected and is kept; one that reaches into the changing text would be
+            // rewritten underneath the user, so the update waits until it is cleared.
+            let start = offsets[first]
+            let selections = text.selectedRanges.map(\.rangeValue).filter { $0.length > 0 }
+            guard selections.allSatisfy({ NSMaxRange($0) <= start }) else { return }
+
             let scroll = text.enclosingScrollView
             let origin = scroll?.contentView.bounds.origin ?? .zero
             let visible = scroll?.documentVisibleRect ?? .zero
@@ -113,7 +129,6 @@ struct LiveTranscriptTextView: NSViewRepresentable {
                 .paragraphStyle: paragraph
             ]
             let replacement = NSMutableAttributedString(string: "")
-            let start = offsets[first]
             offsets.removeSubrange((first + 1)..<offsets.count)
             for index in first..<next.segments.count {
                 let original = next.segments[index].text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -134,7 +149,11 @@ struct LiveTranscriptTextView: NSViewRepresentable {
             storage.beginEditing()
             storage.replaceCharacters(in: NSRange(location: start, length: storage.length - start), with: replacement)
             storage.endEditing()
-            text.setSelectedRange(NSRange(location: caret, length: 0))
+            if selections.isEmpty {
+                text.setSelectedRange(NSRange(location: caret, length: 0))
+            } else {
+                text.selectedRanges = selections.map { NSValue(range: $0) }
+            }
             rendered = next
             if follow {
                 text.scrollRangeToVisible(NSRange(location: storage.length, length: 0))

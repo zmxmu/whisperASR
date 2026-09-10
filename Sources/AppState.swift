@@ -548,7 +548,10 @@ class AppState {
                     print("[AppState] live transcription chunk error: \(error)")
                 }
 
-                try? await Task.sleep(for: .seconds(min(1.0, max(0.35, inferenceDuration * 0.35))))
+                // Idle in proportion to the last pass so a slow model does not run whisper
+                // back-to-back (~85% duty); this keeps the GPU/CPU duty cycle near 2/3 and
+                // leaves headroom for the UI, at the cost of ≤1s extra latency on slow models.
+                try? await Task.sleep(for: .seconds(min(2.0, max(0.35, inferenceDuration * 0.5))))
             }
         }
     }

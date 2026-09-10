@@ -1,4 +1,5 @@
 import Foundation
+import Accelerate
 import ScreenCaptureKit
 import AVFoundation
 import Observation
@@ -125,18 +126,18 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Compute the RMS energy of a range of samples without copying the buffer.
     /// Used by the transcription loop to skip whisper inference on silence.
+    /// vDSP keeps the lock hold short: the capture thread appends under the same lock.
     func rmsEnergy(from startIndex: Int, count: Int) -> Float {
         pcmState.withLock { state in
             let bufStart = startIndex - state.trimOffset
             guard bufStart >= 0 else { return 0 }
             let bufEnd = min(bufStart + count, state.buffer.count)
             guard bufEnd > bufStart else { return 0 }
-            var sumSquares: Float = 0
-            for i in bufStart..<bufEnd {
-                let s = state.buffer[i]
-                sumSquares += s * s
+            return state.buffer.withUnsafeBufferPointer { buf in
+                var rms: Float = 0
+                vDSP_rmsqv(buf.baseAddress! + bufStart, 1, &rms, vDSP_Length(bufEnd - bufStart))
+                return rms
             }
-            return sqrt(sumSquares / Float(bufEnd - bufStart))
         }
     }
 
@@ -160,15 +161,13 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             let frameCount = (bufEnd - bufStart) / frameSamples
             guard frameCount > 0 else { return nil }
             var isSilent = [Bool](repeating: false, count: frameCount)
-            for f in 0..<frameCount {
-                let s = bufStart + f * frameSamples
-                let e = s + frameSamples
-                var sumSquares: Float = 0
-                for i in s..<e {
-                    let v = state.buffer[i]
-                    sumSquares += v * v
+            state.buffer.withUnsafeBufferPointer { buf in
+                let base = buf.baseAddress! + bufStart
+                for f in 0..<frameCount {
+                    var rms: Float = 0
+                    vDSP_rmsqv(base + f * frameSamples, 1, &rms, vDSP_Length(frameSamples))
+                    isSilent[f] = rms < silenceThreshold
                 }
-                isSilent[f] = sqrt(sumSquares / Float(frameSamples)) < silenceThreshold
             }
 
             // Walk from the right: find the rightmost run of >= minSilenceFrames silent frames
@@ -822,9 +821,11 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             state.buffer.append(contentsOf: resampled)
             // Bound memory even if model loading/inference stalls or live text is disabled.
             // The full recording is written independently through AVAssetWriter.
+            // Trim back to 60s once past 90s, so the O(n) memmove runs every ~30s at the cap
+            // instead of once per second on the capture thread.
             let maximum = 16000 * 90
             if state.buffer.count > maximum {
-                let drop = max(16000, state.buffer.count - maximum)
+                let drop = state.buffer.count - 16000 * 60
                 state.buffer.removeFirst(drop)
                 state.trimOffset += drop
             }
