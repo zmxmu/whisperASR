@@ -1,0 +1,37 @@
+whisperasr-0.6.2-R3 独立复核答复（Claude Fable 5.1 / Extra，只读源码）
+
+一、核对与执行记录
+- HEAD/base 95edefce6ac790c1beba8652b6dd903991ed8e99。
+- round-3-manifest.txt 32 个 SHA-256：开始核对 32/32 匹配，结束核对 32/32 匹配。
+- 与 round-2 清单比对，本轮仅 Sources/AppState.swift 与 Tests/LiveSessionChecks.swift 指纹变化，其余 30 个文件与 R2 一致。
+- swift build 通过（仅既有 xcframework 部署目标 26.0 的 linker warning）。
+- 四组独立检查在本轮指纹上重跑全部通过：LiveAudioChecks、TranscriptionCancellationChecks、LiveTranscriptChecks（3601 段 100 次尾更新约 48 ms）、LiveSessionChecks（约 18 s，PASS，预算越界 0）。
+- 我未修改任何源文件；所有探针与二进制均在会话 scratchpad；本文件是本轮唯一新建的审查结果文件。
+- 桩解码器即时返回，下文的“解码次数”只反映控制流是否有界，不代表真实模型吞吐。
+
+二、独立重跑 R1/R2 复现（真实 AppState + assembler + LiveAudioBuffer，服务/翻译为桩）
+1. R1 assembler ULP 丢段脚本：30473 组，游标越过未封口段 0，丢段 0（assembler 文件本轮未变，作为回归确认）。
+2. R1 噪声尾窗 Finish：completed，无 toast，无文件修复。
+3. R1 单次非 final 空解码：草稿保留（13 段不变），后续恢复到 16 段，Finish completed。
+4. R1 修复路径翻译保留：translatedSegments 保留，translationLanguage=en。
+5. R2 #1 Finish 无限循环：13 s 语音 + 解码器从 chunk 1 起持续为空 + 45 s 噪声积压后 Finish。R2 指纹上 3 s 内 10486 次推理且永不结束；R3 指纹上 Finish 立即完成，总解码 3 次，recorder 回到 idle，条目进入修复（status transcribing），草稿保留。
+6. R2 #2 直播游标卡住：同样条件下持续 100 s 噪声。R2 指纹上 12 次 30 s 窗口推理、第 94 s 触发 cap 淘汰并丢草稿；R3 指纹上仅 2 次解码，在 12 s 新音频预算耗尽时停止推理，banner 为 “Live inference stopped because the draft could not be confirmed…”，草稿 13 段完整保留，未触发淘汰，Finish 后进入修复。
+
+三、针对请求列出的重点新增探针
+- lateFinish：chunk 1 在飞行中被挂起并将返回空，Finish 在其挂起期间到达。final 窗口（积压 2 s）与非 final 积压（45 s）两种形态下，释放解码后 Finish 均在 1 ms 内完成，总解码 2 次，草稿保留，进入修复。对应 AppState.swift:571-584 使用 await 返回后的当前 finishRequested。
+- no-new-audio：首次 retained-empty 后采集空闲 3 s，解码 0 次，live 仍运行，草稿完整。
+- 预算边界：首次空结果时 availableEnd=14 s；再进 10 s 噪声（24 s，新增 10 s）仍为 live 并重试 1 次；再进 2 s（26 s，新增 12 s）后停止，总解码 4 次。与请求描述“自第一次 snapshot.availableEnd 起新增至少 12 s”一致。注意：预算起点包含触发首次空结果的那一包音频，文档与 banner 若写“12 秒”应以此为准。
+- cap 抢先：未单独重跑，代码路径 AppState.swift:502-511 在 firstEmptyAvailableEnd 非空且有草稿时直接 break 进入修复而不 skip，LiveSessionChecks 的 retainedDraftSurvivesBufferEviction 两个变体已覆盖并通过。
+- 保存/翻译顺序：runLiveLoop 的 defer（473-480）在终止修复时同步入队恢复文件保存；翻译 worker 在 live 已停止时对每个接受批次调用 autoSaveLiveTranscription（859-866）；两者与 finishRecording 末尾的 removeLiveRecoveryFile 都在同一串行 recoveryQueue 上按主 actor 程序顺序入队，删除必然在保存之后。worker 在 resetLiveSession 之后因 epoch 与 liveSessionID 失效直接返回，不会在删除后重建恢复文件。
+- 预算重置：587-589 任何非 kept 发布都清空 firstEmpty/lastEmpty，LiveSessionChecks.successfulRevisionResetsEmptyRecoveryBudget 覆盖并通过。
+
+四、结论
+- R2 #1（Finish 排空无限循环）：已解决。
+- R2 #2（直播游标卡住直到 90 s 淘汰）：已解决，改为 12 s 新音频预算后有界停止并保留草稿与译文。
+- 相邻回归：未发现新的确定问题。R1 五项在本轮指纹上仍保持已解决。
+- 当前 32 个指纹对应的源码，我未发现阻挡本机安装的确定问题。
+
+五、非阻挡说明（设计取舍，供知悉）
+1. Finish 排空长积压时，只要某个非 final 窗口返回空且存在草稿，排空即刻结束并把整段录音送入文件修复。探针：65 s 积压、仅第 2 个窗口为空，Finish 在 2 次解码后结束，条目 30 段进入修复，剩余 35 s 不再实时解码。这是有界且保留数据的行为，代价是一次幻觉或 no_speech 判定会把整段录音的最终文本交给整文件重转（翻译若源文本变化会被清空并提示）。
+2. 预算耗尽后 live 不再重启，直到 Finish；录音继续保存。属既定策略。
+3. 未实测项与前两轮相同：真实 Breeze-ASR-25 会议识别率、长会话功耗、macOS 14 兼容、Escape 真实键路径。

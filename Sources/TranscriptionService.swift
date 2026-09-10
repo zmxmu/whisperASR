@@ -1,27 +1,27 @@
 import Foundation
 import CWhisper
+import os
 
 final class TranscriptionService: @unchecked Sendable {
     private var ctx: OpaquePointer?
     private var loadedModelPath: String?
+    private let processExitRequested = OSAllocatedUnfairLock(initialState: false)
+    private let fileRequestsInFlight = OSAllocatedUnfairLock(initialState: 0)
     /// Serial queue to ensure only one whisper_full() runs at a time (ctx is not thread-safe).
-    private let whisperQueue = DispatchQueue(label: "com.whisperasr.whisper", qos: .userInitiated)
+    private let whisperQueue = CancellableTranscriptionQueue(label: "com.whisperasr.whisper")
 
     deinit {
-        if let ctx { whisper_free(ctx) }
+        // A running worker retains self. Outside process termination, deinit can
+        // therefore only release ctx after the last physical C operation returns.
+        if !processExitRequested.withLock({ $0 }), let ctx { whisper_free(ctx) }
     }
 
     func shutdown() {
-        // App termination must wait for any in-flight whisper_full to finish.
-        // An asynchronous cleanup lets the process begin destroying ggml/Metal
-        // globals while inference is still using them, causing EXC_BAD_ACCESS.
-        whisperQueue.sync {
-            if let ctx = self.ctx {
-                whisper_free(ctx)
-                self.ctx = nil
-                self.loadedModelPath = nil
-            }
-        }
+        // Termination only: do not block the main thread on an unresponsive GPU,
+        // and do not enqueue a free that could race process/Metal teardown. Leave
+        // the context alive for process reclamation; this is NOT a model-unload API.
+        processExitRequested.withLock { $0 = true }
+        whisperQueue.shutdown()
     }
 
     /// Transcribe (or translate-to-English, when `translate` is true) an audio file.
@@ -30,81 +30,23 @@ final class TranscriptionService: @unchecked Sendable {
                     language: String? = nil,
                     translate: Bool = false,
                     onProgress: @escaping @Sendable (Double) -> Void) async throws -> TranscriptionResult {
+        try Task.checkCancellation()
+        // Bound decoded-file retention too: admission checks alone would let many
+        // concurrent HTTP requests all start loading PCM before any one queues.
+        let admitted = fileRequestsInFlight.withLock { count -> Bool in
+            guard count < 2 else { return false }
+            count += 1
+            return true
+        }
+        guard admitted else { throw TranscriptionExecutionError.busy }
+        defer { fileRequestsInFlight.withLock { $0 -= 1 } }
+        try whisperQueue.checkAvailability()
         let samples = try await AudioLoader.loadSamples(url: fileURL)
-
-        return try await withCheckedThrowingContinuation { continuation in
-            self.whisperQueue.async {
-                let ctx: OpaquePointer
-                do {
-                    ctx = try self.ensureModelLoaded()
-                    try self.validateLanguage(language, for: ctx)
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                var (params, langCStr) = self.makeBaseParams(language: language, translate: translate)
-                defer { free(langCStr) }
-
-                // Progress callback
-                let progressPtr = Unmanaged.passRetained(ProgressBox(handler: onProgress)).toOpaque()
-                params.progress_callback_user_data = progressPtr
-                params.progress_callback = { (_: OpaquePointer?, _: OpaquePointer?, progress: Int32, userData: UnsafeMutableRawPointer?) in
-                    guard let userData else { return }
-                    let box = Unmanaged<ProgressBox>.fromOpaque(userData).takeUnretainedValue()
-                    let value = Double(progress) / 100.0
-                    DispatchQueue.main.async {
-                        box.handler(value)
-                    }
-                }
-
-                // Run transcription
-                let result = samples.withUnsafeBufferPointer { buf in
-                    whisper_full(ctx, params, buf.baseAddress, Int32(buf.count))
-                }
-
-                // Release progress box
-                Unmanaged<ProgressBox>.fromOpaque(progressPtr).release()
-
-                if result != 0 {
-                    continuation.resume(throwing: TranscriptionError.processFailed("whisper_full returned error \(result)"))
-                    return
-                }
-
-                // Extract segments
-                let nSegments = whisper_full_n_segments(ctx)
-                var segments: [TranscriptionSegment] = []
-                var fullText = ""
-                let detected = self.detectedLanguage(in: ctx)
-
-                for i in 0..<nSegments {
-                    let t0 = whisper_full_get_segment_t0(ctx, i)  // centiseconds (10ms units)
-                    let t1 = whisper_full_get_segment_t1(ctx, i)
-                    let text: String
-                    if let cStr = whisper_full_get_segment_text(ctx, i) {
-                        text = self.normalizedScript(
-                            String(cString: cStr),
-                            language: detected,
-                            translate: translate
-                        )
-                    } else {
-                        text = ""
-                    }
-
-                    segments.append(TranscriptionSegment(
-                        start: Double(t0) / 100.0,  // convert centiseconds → seconds
-                        end: Double(t1) / 100.0,
-                        text: text
-                    ))
-                    fullText += text
-                }
-
-                continuation.resume(returning: TranscriptionResult(
-                    text: fullText,
-                    segments: segments,
-                    detectedLanguage: detected
-                ))
-            }
+        try Task.checkCancellation()
+        return try await whisperQueue.perform(timeoutSeconds: max(60, Double(samples.count) / 16000 * 4)) { cancellation in
+            try self.runTranscription(samples: samples, language: language,
+                                      translate: translate, threadCount: nil,
+                                      cancellation: cancellation, onProgress: onProgress)
         }
     }
 
@@ -112,76 +54,91 @@ final class TranscriptionService: @unchecked Sendable {
 
     /// Transcribe raw 16kHz mono PCM Float32 samples directly (used for live transcription during recording).
     /// This reuses the already-loaded whisper model and runs on a background queue.
-    func transcribeChunk(samples: [Float], language: String? = nil) async throws -> TranscriptionResult {
+    func transcribeChunk(samples: [Float], language: String? = nil,
+                         timeoutSeconds: TimeInterval? = nil) async throws -> TranscriptionResult {
+        try Task.checkCancellation()
         guard !samples.isEmpty else {
             return TranscriptionResult(text: "", segments: [])
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            self.whisperQueue.async {
-                let ctx: OpaquePointer
-                do {
-                    ctx = try self.ensureModelLoaded()
-                    try self.validateLanguage(language, for: ctx)
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                let liveThreads = min(4, max(1, Int32(ProcessInfo.processInfo.activeProcessorCount / 4)))
-                let (params, langCStr) = self.makeBaseParams(
-                    threadCount: liveThreads,
-                    language: language
-                )
-                defer { free(langCStr) }
-
-                let result = samples.withUnsafeBufferPointer { buf in
-                    whisper_full(ctx, params, buf.baseAddress, Int32(buf.count))
-                }
-
-                if result != 0 {
-                    continuation.resume(throwing: TranscriptionError.processFailed("whisper_full returned error \(result)"))
-                    return
-                }
-
-                let nSegments = whisper_full_n_segments(ctx)
-                var segments: [TranscriptionSegment] = []
-                var fullText = ""
-                let detected = self.detectedLanguage(in: ctx)
-
-                for i in 0..<nSegments {
-                    let t0 = whisper_full_get_segment_t0(ctx, i)
-                    let t1 = whisper_full_get_segment_t1(ctx, i)
-                    let text: String
-                    if let cStr = whisper_full_get_segment_text(ctx, i) {
-                        text = self.normalizedScript(String(cString: cStr), language: detected)
-                    } else {
-                        text = ""
-                    }
-
-                    segments.append(TranscriptionSegment(
-                        start: Double(t0) / 100.0,
-                        end: Double(t1) / 100.0,
-                        text: text
-                    ))
-                    fullText += text
-                }
-
-                continuation.resume(returning: TranscriptionResult(
-                    text: fullText,
-                    segments: segments,
-                    detectedLanguage: detected
-                ))
-            }
+        let timeout = timeoutSeconds ?? max(60, Double(samples.count) / 16000 * 4)
+        return try await whisperQueue.perform(timeoutSeconds: timeout) { cancellation in
+            let liveThreads = min(4, max(1, Int32(ProcessInfo.processInfo.activeProcessorCount / 4)))
+            return try self.runTranscription(samples: samples, language: language,
+                                            translate: false, threadCount: liveThreads,
+                                            cancellation: cancellation, onProgress: nil)
         }
     }
 
     /// Ensure the whisper model is loaded (public access for pre-loading during recording start).
-    /// Blocks until any queued transcription finishes, then loads on the whisper queue.
-    func preloadModel() throws {
-        try whisperQueue.sync {
-            _ = try ensureModelLoaded()
+    /// Cancellation/timeout resumes the caller even if model loading cannot be interrupted.
+    /// The model operation still owns the serial slot until its C call really returns.
+    func preloadModel() async throws {
+        try await whisperQueue.perform(timeoutSeconds: 60) { cancellation in
+            try cancellation.checkCancellation()
+            _ = try self.ensureModelLoaded()
+            try cancellation.checkCancellation()
         }
+    }
+
+    private func runTranscription(samples: [Float], language: String?, translate: Bool,
+                                  threadCount: Int32?, cancellation: TranscriptionCancellation,
+                                  onProgress: (@Sendable (Double) -> Void)?) throws -> TranscriptionResult {
+        try cancellation.checkCancellation()
+        let ctx = try ensureModelLoaded()
+        try cancellation.checkCancellation()
+        try validateLanguage(language, for: ctx)
+
+        var (params, langCStr) = makeBaseParams(threadCount: threadCount,
+                                              language: language, translate: translate)
+        defer { free(langCStr) }
+        // The retained box, samples, params and self live until whisper_full returns,
+        // even when Swift has already resumed the caller with cancellation/timeout.
+        let callbackBox = InferenceCallbackBox(cancellation: cancellation, progress: onProgress)
+        let callbackPtr = Unmanaged.passRetained(callbackBox).toOpaque()
+        defer { Unmanaged<InferenceCallbackBox>.fromOpaque(callbackPtr).release() }
+        params.abort_callback_user_data = callbackPtr
+        params.abort_callback = { userData in
+            guard let userData else { return false }
+            return Unmanaged<InferenceCallbackBox>.fromOpaque(userData)
+                .takeUnretainedValue().cancellation.isCancelled
+        }
+        if onProgress != nil {
+            params.progress_callback_user_data = callbackPtr
+            params.progress_callback = { _, _, progress, userData in
+                guard let userData else { return }
+                let box = Unmanaged<InferenceCallbackBox>.fromOpaque(userData).takeUnretainedValue()
+                guard !box.cancellation.isCancelled else { return }
+                DispatchQueue.main.async {
+                    guard !box.cancellation.isCancelled else { return }
+                    box.progress?(Double(progress) / 100)
+                }
+            }
+        }
+
+        let result = samples.withUnsafeBufferPointer { buf in
+            whisper_full(ctx, params, buf.baseAddress, Int32(buf.count))
+        }
+        try cancellation.checkCancellation()
+        guard result == 0 else {
+            throw TranscriptionError.processFailed("whisper_full returned error \(result)")
+        }
+
+        let detected = detectedLanguage(in: ctx)
+        var segments: [TranscriptionSegment] = []
+        var fullText = ""
+        for i in 0..<whisper_full_n_segments(ctx) {
+            try cancellation.checkCancellation()
+            let t0 = whisper_full_get_segment_t0(ctx, i)
+            let t1 = whisper_full_get_segment_t1(ctx, i)
+            let text = whisper_full_get_segment_text(ctx, i).map {
+                normalizedScript(String(cString: $0), language: detected, translate: translate)
+            } ?? ""
+            segments.append(TranscriptionSegment(start: Double(t0) / 100,
+                                                  end: Double(t1) / 100, text: text))
+            fullText += text
+        }
+        return TranscriptionResult(text: fullText, segments: segments, detectedLanguage: detected)
     }
 
     // MARK: - Params Configuration
@@ -282,7 +239,7 @@ final class TranscriptionService: @unchecked Sendable {
     /// crash a whisper_full running concurrently on the queue if done anywhere else.
     @discardableResult
     private func ensureModelLoaded() throws -> OpaquePointer {
-        dispatchPrecondition(condition: .onQueue(whisperQueue))
+        whisperQueue.assertOnQueue()
         let path = resolveModelPath()
         guard FileManager.default.fileExists(atPath: path) else {
             throw TranscriptionError.modelNotFound(
@@ -345,10 +302,12 @@ final class TranscriptionService: @unchecked Sendable {
     }
 }
 
-// Box for passing progress handler through C callback
-private class ProgressBox {
-    let handler: @Sendable (Double) -> Void
-    init(handler: @escaping @Sendable (Double) -> Void) {
-        self.handler = handler
+// Shared callback state is retained until the C operation actually returns.
+private final class InferenceCallbackBox: @unchecked Sendable {
+    let cancellation: TranscriptionCancellation
+    let progress: (@Sendable (Double) -> Void)?
+    init(cancellation: TranscriptionCancellation, progress: (@Sendable (Double) -> Void)?) {
+        self.cancellation = cancellation
+        self.progress = progress
     }
 }

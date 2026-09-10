@@ -1,5 +1,4 @@
 import Foundation
-import Accelerate
 import ScreenCaptureKit
 import AVFoundation
 import Observation
@@ -46,6 +45,12 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var audioWatchdogTimer: Timer?
     private var recordingApp: SCRunningApplication?
     private var isRestartingStream = false
+    @ObservationIgnored private var streamRestartTask: Task<Void, Never>?
+    /// Reused across watchdog restarts, so stopping can drain every audio callback.
+    @ObservationIgnored private let captureQueue = DispatchQueue(label: "com.whisperasr.audio-capture")
+    // A nil identity closes the gate. Updates are ordered on captureQueue; the
+    // lock also lets its Sendable box cross the async queue boundary safely.
+    @ObservationIgnored private let acceptedStream = OSAllocatedUnfairLock(initialState: Optional<ObjectIdentifier>.none)
     /// How long without audio before we consider the stream stalled (seconds).
     private static let audioStallThreshold: TimeInterval = 15
 
@@ -55,13 +60,7 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var isMicActive = false
     private static let maxMicBufferSamples = 48000 * 5 // 5 seconds cap
 
-    // Live transcription: accumulated 16kHz mono PCM samples.
-    // Buffer + trimOffset are in a single lock so reads/writes are always atomic.
-    private struct PCMState {
-        var buffer: [Float] = []
-        var trimOffset: Int = 0
-    }
-    private var pcmState = OSAllocatedUnfairLock(initialState: PCMState())
+    @ObservationIgnored private let pcmBuffer = LiveAudioBuffer()
 
     // 48kHz → 16kHz resampler for live transcription (AVAudioConverter applies
     // a proper anti-alias low-pass filter; naive decimation aliased above 8kHz).
@@ -75,129 +74,30 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }()
     /// Total number of 16kHz samples accumulated since recording started (absolute count).
     var accumulatedSampleCount: Int {
-        pcmState.withLock { $0.trimOffset + $0.buffer.count }
+        pcmBuffer.availableRange.upperBound
     }
 
     var oldestAvailableSample: Int {
-        pcmState.withLock { $0.trimOffset }
+        pcmBuffer.availableRange.lowerBound
     }
 
     private static let zoomBundleIDs: Set<String> = ["us.zoom.xos", "us.zoom.videomeeting"]
 
     // MARK: - Live Transcription PCM Access
 
-    /// Returns a copy of all accumulated 16kHz PCM samples for live transcription.
-    func getAccumulatedSamples() -> [Float] {
-        pcmState.withLock { Array($0.buffer) }
-    }
-
-    /// Returns only the samples from absolute `startIndex` onward — avoids copying the entire
-    /// buffer during long recordings (which can be hundreds of MB after 30+ minutes).
-    func getSamples(from startIndex: Int) -> [Float] {
-        pcmState.withLock { state in
-            let bufIndex = startIndex - state.trimOffset
-            guard bufIndex >= 0, bufIndex < state.buffer.count else { return [] }
-            return Array(state.buffer[bufIndex...])
-        }
-    }
-
-    /// Returns the samples in the absolute range `[startIndex, endIndex)` — used to copy only the
-    /// audio a chunk needs when its end is held back from the live tail.
-    func getSamples(from startIndex: Int, upTo endIndex: Int) -> [Float] {
-        pcmState.withLock { state in
-            let bufStart = startIndex - state.trimOffset
-            let bufEnd = min(endIndex - state.trimOffset, state.buffer.count)
-            guard bufStart >= 0, bufEnd > bufStart else { return [] }
-            return Array(state.buffer[bufStart..<bufEnd])
-        }
+    func transcriptionSnapshot(from startIndex: Int, maximumCount: Int) -> LiveAudioSnapshot {
+        pcmBuffer.snapshot(from: startIndex, maximumCount: maximumCount)
     }
 
     /// Trim committed samples from the front of the PCM buffer to cap memory usage.
     /// `upTo` is an absolute sample index — samples before this index are freed.
     func trimSamples(upTo absoluteIndex: Int) {
-        pcmState.withLock { state in
-            let bufIndex = absoluteIndex - state.trimOffset
-            guard bufIndex > 0 else { return }
-            let trimCount = min(bufIndex, state.buffer.count)
-            state.buffer.removeFirst(trimCount)
-            state.trimOffset += trimCount
-        }
-    }
-
-    /// Compute the RMS energy of a range of samples without copying the buffer.
-    /// Used by the transcription loop to skip whisper inference on silence.
-    /// vDSP keeps the lock hold short: the capture thread appends under the same lock.
-    func rmsEnergy(from startIndex: Int, count: Int) -> Float {
-        pcmState.withLock { state in
-            let bufStart = startIndex - state.trimOffset
-            guard bufStart >= 0 else { return 0 }
-            let bufEnd = min(bufStart + count, state.buffer.count)
-            guard bufEnd > bufStart else { return 0 }
-            return state.buffer.withUnsafeBufferPointer { buf in
-                var rms: Float = 0
-                vDSP_rmsqv(buf.baseAddress! + bufStart, 1, &rms, vDSP_Length(bufEnd - bufStart))
-                return rms
-            }
-        }
-    }
-
-    /// Scan the absolute range `[searchFrom, searchTo)` in fixed `frameSamples`-sized frames and
-    /// return the absolute sample index at the START of the rightmost silence run of at least
-    /// `minSilenceFrames` frames, provided at least one speech frame precedes it. A frame is
-    /// "silent" when its RMS is below `silenceThreshold`.
-    ///
-    /// Used to place live-transcription chunk cuts at natural pauses: cutting here lets the loop
-    /// commit the completed utterance and hold back any trailing in-progress speech. Returns nil
-    /// when no qualifying trailing silence exists (e.g. continuous speech). Computed under a single
-    /// lock so it stays atomic with concurrent appends/trims.
-    func lastSilenceCut(searchFrom: Int, searchTo: Int,
-                        frameSamples: Int, silenceThreshold: Float, minSilenceFrames: Int) -> Int? {
-        pcmState.withLock { state in
-            let bufStart = max(0, searchFrom - state.trimOffset)
-            let bufEnd = min(searchTo - state.trimOffset, state.buffer.count)
-            guard frameSamples > 0, bufEnd - bufStart >= frameSamples else { return nil }
-
-            // Per-frame silence flags over the search range.
-            let frameCount = (bufEnd - bufStart) / frameSamples
-            guard frameCount > 0 else { return nil }
-            var isSilent = [Bool](repeating: false, count: frameCount)
-            state.buffer.withUnsafeBufferPointer { buf in
-                let base = buf.baseAddress! + bufStart
-                for f in 0..<frameCount {
-                    var rms: Float = 0
-                    vDSP_rmsqv(base + f * frameSamples, 1, &rms, vDSP_Length(frameSamples))
-                    isSilent[f] = rms < silenceThreshold
-                }
-            }
-
-            // Walk from the right: find the rightmost run of >= minSilenceFrames silent frames
-            // whose start has at least one speech frame before it.
-            var run = 0
-            var f = frameCount - 1
-            while f >= 0 {
-                if isSilent[f] {
-                    run += 1
-                    if run >= minSilenceFrames {
-                        let runStartFrame = f               // start of this silence run
-                        let hasSpeechBefore = (0..<runStartFrame).contains { !isSilent[$0] }
-                        guard hasSpeechBefore else { return nil }
-                        return state.trimOffset + bufStart + runStartFrame * frameSamples
-                    }
-                } else {
-                    run = 0
-                }
-                f -= 1
-            }
-            return nil
-        }
+        pcmBuffer.trim(upTo: absoluteIndex)
     }
 
     /// Clears the accumulated PCM sample buffer (called when recording ends).
-    private func clearPCMBuffer() {
-        pcmState.withLock { state in
-            state.buffer.removeAll()
-            state.trimOffset = 0
-        }
+    func clearTranscriptionBuffer() {
+        pcmBuffer.clear()
     }
 
     // MARK: - App List
@@ -258,7 +158,7 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         guard state == .ready else { return }
         saveRecentApp(bundleID: app.bundleIdentifier)
 
-        Task {
+        Task { @MainActor in
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
                 guard let display = content.displays.first else {
@@ -300,15 +200,16 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.assetWriterInput = input
                 self.outputURL = fileURL
                 self._hasReceivedSamples.withLock { $0 = false }
-                self.clearPCMBuffer()
+                self.clearTranscriptionBuffer()
+                self.pcmResampler?.reset()
 
                 self.recordingApp = app
 
                 let stream = SCStream(filter: filter, configuration: config, delegate: self)
-                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.whisperasr.audio-capture"))
-                try await stream.startCapture()
-
+                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
                 self.stream = stream
+                await self.acceptAudio(from: stream)
+                try await stream.startCapture()
                 self.recordingAppName = app.applicationName
 
                 if self.includeMicrophone {
@@ -339,8 +240,10 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 // the next attempt starts from a clean slate.
                 if let stream = self.stream {
                     try? await stream.stopCapture()
+                    try? stream.removeStreamOutput(self, type: .audio)
                     self.stream = nil
                 }
+                await self.drainCaptureQueue()
                 if let writer = self.assetWriter {
                     writer.cancelWriting()
                 }
@@ -361,7 +264,8 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: - Stop Recording
 
-    func stopRecording() async -> URL? {
+    @MainActor
+    func stopRecording(preservePCM: Bool = false) async -> URL? {
         await MainActor.run {
             state = .saving
             timer?.invalidate()
@@ -370,13 +274,9 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             stopAudioWatchdog()
         }
 
-        if let stream {
-            try? await stream.stopCapture()
-            self.stream = nil
-        }
-
+        await stopCaptureAndDrain()
         stopMicrophoneCapture()
-        clearPCMBuffer()
+        if !preservePCM { clearTranscriptionBuffer() }
         recordingApp = nil
 
         let received = _hasReceivedSamples.withLock { $0 }
@@ -416,14 +316,12 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Cancel Recording
 
     func cancelRecording() {
-        Task {
-            if let stream {
-                try? await stream.stopCapture()
-                self.stream = nil
-            }
-
+        Task { @MainActor in
+            self.state = .saving
+            self.stopAudioWatchdog()
+            await self.stopCaptureAndDrain()
             self.stopMicrophoneCapture()
-            self.clearPCMBuffer()
+            self.clearTranscriptionBuffer()
             self.recordingApp = nil
 
             if let writer = assetWriter {
@@ -442,6 +340,43 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 stopMeetingMonitor()
                 stopAudioWatchdog()
                 recordingDuration = 0
+            }
+        }
+    }
+
+    @MainActor
+    private func stopCaptureAndDrain() async {
+        // A watchdog restart must not publish a replacement stream after Finish.
+        let restart = streamRestartTask
+        restart?.cancel()
+        await restart?.value
+        if let stream {
+            try? await stream.stopCapture()
+            try? stream.removeStreamOutput(self, type: .audio)
+            self.stream = nil
+        }
+        await drainCaptureQueue()
+    }
+
+    private func drainCaptureQueue() async {
+        let gate = acceptedStream
+        await withCheckedContinuation { continuation in
+            captureQueue.async {
+                // Everything submitted before this barrier has completed. Any
+                // unexpectedly late callback is rejected before touching PCM/writer.
+                gate.withLock { $0 = nil }
+                continuation.resume()
+            }
+        }
+    }
+
+    private func acceptAudio(from stream: SCStream) async {
+        let gate = acceptedStream
+        let identity = ObjectIdentifier(stream)
+        await withCheckedContinuation { continuation in
+            captureQueue.async {
+                gate.withLock { $0 = identity }
+                continuation.resume()
             }
         }
     }
@@ -592,7 +527,10 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         print("[AudioRecorder] SCStream stopped with error: \(error)")
         // Attempt to restart the stream automatically
-        restartStream()
+        Task { @MainActor in
+            guard self.stream === stream else { return }
+            self.restartStream()
+        }
     }
 
     // MARK: - Audio Watchdog
@@ -625,33 +563,36 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         let elapsed = Date().timeIntervalSince(lastTime)
         if elapsed > Self.audioStallThreshold {
             print("[AudioRecorder] audio stall detected: no buffers for \(String(format: "%.1f", elapsed))s, restarting stream")
-            restartStream()
+            Task { @MainActor in self.restartStream() }
         }
     }
 
+    @MainActor
     private func restartStream() {
         guard state == .recording, !isRestartingStream else { return }
         isRestartingStream = true
 
-        Task {
+        streamRestartTask = Task { @MainActor in
+            defer {
+                self.isRestartingStream = false
+                self.streamRestartTask = nil
+            }
             // Stop the old stream
             if let oldStream = self.stream {
                 try? await oldStream.stopCapture()
+                try? oldStream.removeStreamOutput(self, type: .audio)
                 self.stream = nil
             }
+            await self.drainCaptureQueue()
 
             // Rebuild a fresh SCStream with the same app
-            guard let app = self.recordingApp else {
-                isRestartingStream = false
-                return
-            }
+            guard !Task.isCancelled, self.state == .recording,
+                  let app = self.recordingApp else { return }
 
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                guard let display = content.displays.first else {
-                    isRestartingStream = false
-                    return
-                }
+                guard !Task.isCancelled, self.state == .recording,
+                      let display = content.displays.first else { return }
 
                 let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
 
@@ -665,17 +606,30 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
                 let newStream = SCStream(filter: filter, configuration: config, delegate: self)
-                try newStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.whisperasr.audio-capture"))
-                try await newStream.startCapture()
+                try newStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
                 self.stream = newStream
+                await self.acceptAudio(from: newStream)
+                try await newStream.startCapture()
+                guard !Task.isCancelled, self.state == .recording else {
+                    try? await newStream.stopCapture()
+                    try? newStream.removeStreamOutput(self, type: .audio)
+                    self.stream = nil
+                    await self.drainCaptureQueue()
+                    return
+                }
                 self.lastAudioBufferTime.withLock { $0 = Date() }
 
                 print("[AudioRecorder] stream restarted successfully")
             } catch {
+                if let failedStream = self.stream {
+                    try? await failedStream.stopCapture()
+                    try? failedStream.removeStreamOutput(self, type: .audio)
+                    self.stream = nil
+                }
+                await self.drainCaptureQueue()
                 print("[AudioRecorder] stream restart failed: \(error)")
             }
 
-            isRestartingStream = false
         }
     }
 
@@ -741,6 +695,7 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - SCStreamOutput
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard acceptedStream.withLock({ $0 == ObjectIdentifier(stream) }) else { return }
         guard type == .audio else { return }
         guard sampleBuffer.isValid, sampleBuffer.numSamples > 0 else { return }
 
@@ -817,19 +772,7 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
               let outputChannel = outputBuffer.floatChannelData?[0] else { return }
 
         let resampled = Array(UnsafeBufferPointer(start: outputChannel, count: Int(outputBuffer.frameLength)))
-        pcmState.withLock { state in
-            state.buffer.append(contentsOf: resampled)
-            // Bound memory even if model loading/inference stalls or live text is disabled.
-            // The full recording is written independently through AVAssetWriter.
-            // Trim back to 60s once past 90s, so the O(n) memmove runs every ~30s at the cap
-            // instead of once per second on the capture thread.
-            let maximum = 16000 * 90
-            if state.buffer.count > maximum {
-                let drop = state.buffer.count - 16000 * 60
-                state.buffer.removeFirst(drop)
-                state.trimOffset += drop
-            }
-        }
+        pcmBuffer.append(resampled)
     }
 
     // MARK: - Output URL

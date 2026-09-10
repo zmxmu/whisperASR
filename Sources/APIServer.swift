@@ -300,6 +300,12 @@ private struct OpenAITranscriptionAPI: Sendable {
             Self.log(String(format: "%@: 200 ok (%d chars, %d segments) in %.1fs",
                             kind, result.text.count, result.segments.count, secs))
             return Self.formatResult(result, format: responseFormat, translate: translate)
+        } catch TranscriptionExecutionError.busy {
+            return Self.errorResponse(.serviceUnavailable, "Transcription service is busy; retry after the current operation finishes.", type: "server_error")
+        } catch TranscriptionExecutionError.queuedTimedOut {
+            return Self.errorResponse(.serviceUnavailable, "Transcription queue wait timed out; retry after the current operation finishes.", type: "server_error")
+        } catch TranscriptionExecutionError.timedOut {
+            return Self.errorResponse(.gatewayTimeout, "Transcription timed out.", type: "server_error")
         } catch {
             let secs = Date().timeIntervalSince(start)
             Self.log(String(format: "%@: 500 transcribe failed after %.1fs: %@",

@@ -157,6 +157,9 @@ struct RecordingView: View {
 private struct LiveTranscriptPane: View {
     @Environment(AppState.self) private var appState
     @AppStorage("transcriptFontSize") private var transcriptFontSizeRaw = TranscriptFontSize.normal.rawValue
+    @State private var hasShownText = false
+    @State private var displayPaused = false
+    @State private var resumeRequest: UInt64 = 0
     let translationOnly: Bool
 
     private var fontSize: TranscriptFontSize { TranscriptFontSize(rawValue: transcriptFontSizeRaw) ?? .normal }
@@ -169,30 +172,49 @@ private struct LiveTranscriptPane: View {
             if let message = appState.liveTranslationError {
                 errorBanner(message: message, tint: .orange)
             }
-            if appState.isLiveTranscribing && appState.liveSegments.isEmpty {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Waiting for audio...")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal)
-                .frame(maxHeight: .infinity)
-            }
-
-            if !appState.liveSegments.isEmpty {
+            // Keep the native document alive even when a provisional first result is
+            // removed. Its coordinator can then preserve a selected, frozen snapshot.
+            ZStack {
                 LiveTranscriptTextView(
                     segments: appState.liveSegments,
                     translations: appState.liveTranslatedSegments,
                     revision: appState.liveTextRevision,
                     fontSize: fontSize,
-                    translationOnly: translationOnly
+                    translationOnly: translationOnly,
+                    sourceRevision: appState.liveTextSourceRevision,
+                    dirtyFrom: appState.liveTextDirtyFrom,
+                    resumeRequest: resumeRequest,
+                    onPauseChanged: { displayPaused = $0 }
                 )
-                .help("Drag to select across lines; ⌘C copies. Earlier text stays selected while new text keeps arriving; a selection that includes the newest line pauses display updates until you click.")
+                .help("⌘C copies selected text. ⌘A pauses the displayed snapshot. Right-click to copy original, translation, or timestamped paragraphs. Click outside the selection, press Escape, or Resume to continue.")
+
+                if appState.isLiveTranscribing && appState.liveSegments.isEmpty && !hasShownText {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Waiting for audio...")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .allowsHitTesting(false)
+                }
+            }
+            if displayPaused {
+                HStack(spacing: 8) {
+                    Text("Display paused — recording continues")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Resume") { resumeRequest &+= 1 }
+                        .controlSize(.small)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: appState.liveSegments.isEmpty, initial: true) { _, empty in
+            if !empty { hasShownText = true }
+        }
     }
 
     private func errorBanner(message: String, tint: Color) -> some View {
