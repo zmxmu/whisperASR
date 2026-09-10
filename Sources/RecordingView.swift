@@ -5,7 +5,6 @@ struct RecordingView: View {
     @Environment(AppState.self) var appState
     @Environment(AudioRecorder.self) var recorder
     @Environment(\.dismiss) var dismiss
-    @State private var shouldAutoScroll = true
     @State private var isAlwaysOnTop = false
     @State private var translationOnly = false
     @AppStorage("transcriptFontSize") private var transcriptFontSizeRaw = TranscriptFontSize.normal.rawValue
@@ -148,32 +147,14 @@ struct RecordingView: View {
             }
 
             if !appState.liveSegments.isEmpty {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        Text(liveTranscriptText)
-                            .font(fontSize.bodyFont)
-                            .foregroundStyle(.primary.opacity(0.85))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id("bottomAnchor")
-                    }
-                    .background(
-                        ScrollPositionObserver(isAtBottom: $shouldAutoScroll)
-                            .frame(width: 0, height: 0)
-                            .allowsHitTesting(false)
-                    )
-                    .onChange(of: appState.liveSegments.count) { _, _ in
-                        deferredScrollToBottom(proxy: proxy)
-                    }
-                    .onChange(of: appState.liveTranslatedSegments) { _, _ in
-                        deferredScrollToBottom(proxy: proxy)
-                    }
-                }
+                LiveTranscriptTextView(
+                    segments: appState.liveSegments,
+                    translations: appState.liveTranslatedSegments,
+                    revision: appState.liveTextRevision,
+                    fontSize: fontSize,
+                    translationOnly: translationOnly
+                )
+                .help("Drag to select across lines; ⌘C copies. Display updates pause while text is selected; recording continues. Click to resume.")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -193,21 +174,6 @@ struct RecordingView: View {
 
     // MARK: - Helpers
 
-    private var liveTranscriptText: String {
-        appState.liveSegments.enumerated().compactMap { index, segment in
-            let original = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let translation = index < appState.liveTranslatedSegments.count
-                ? appState.liveTranslatedSegments[index].trimmingCharacters(in: .whitespacesAndNewlines)
-                : ""
-
-            if translationOnly {
-                return translation.isEmpty ? nil : translation
-            }
-            return translation.isEmpty ? original : "\(original)\n\(translation)"
-        }
-        .joined(separator: "\n")
-    }
-
     private func errorBanner(message: String, tint: Color) -> some View {
         HStack(spacing: 6) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -221,18 +187,6 @@ struct RecordingView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(tint.opacity(0.12))
-    }
-
-    /// Defer the actual scroll until the ScrollView finishes layout, and re-check
-    /// shouldAutoScroll inside the dispatch so a concurrent user scroll-up
-    /// (which updates the flag synchronously via the observer) takes effect
-    /// before we decide whether to snap back to the bottom.
-    private func deferredScrollToBottom(proxy: ScrollViewProxy) {
-        guard !appState.liveSegments.isEmpty else { return }
-        DispatchQueue.main.async {
-            guard shouldAutoScroll else { return }
-            proxy.scrollTo("bottomAnchor", anchor: .bottom)
-        }
     }
 
     private func stopAndDismiss() {
@@ -256,165 +210,6 @@ struct RecordingView: View {
 
 }
 
-// MARK: - Live Segment Row
-
-/// Extracted row view with Equatable conformance so SwiftUI can skip
-/// re-rendering rows whose segment + translation haven't changed.
-private struct LiveSegmentRow: View, Equatable {
-    let segment: TranscriptionSegment
-    let translation: String
-    let fontSize: TranscriptFontSize
-    let translationOnly: Bool
-
-    private static let translationColor = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor.systemTeal.withAlphaComponent(0.85)
-            : NSColor.systemBlue.withAlphaComponent(0.75)
-    }))
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if !translationOnly {
-                Text(segment.text.trimmingCharacters(in: .whitespaces))
-                    .font(fontSize.bodyFont)
-                    .foregroundStyle(.primary.opacity(0.85))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            if !translation.isEmpty {
-                Text(translation)
-                    .font(translationOnly ? fontSize.bodyFont : fontSize.translationFont)
-                    .foregroundStyle(Self.translationColor)
-                    .italic(translationOnly ? false : true)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-    }
-}
-
-// MARK: - Scroll Position Observer
-
-/// Observes the enclosing NSScrollView's scroll position via native bounds-change
-/// notifications. Uses a 150px threshold to tolerate content growth (e.g. translations
-/// appended) without prematurely disabling auto-scroll.
-private struct ScrollPositionObserver: NSViewRepresentable {
-    @Binding var isAtBottom: Bool
-
-    class PassthroughView: NSView {
-        var onMoveToWindow: (() -> Void)?
-
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if window != nil {
-                onMoveToWindow?()
-            }
-        }
-    }
-
-    func makeNSView(context: Context) -> NSView {
-        let view = PassthroughView()
-        view.onMoveToWindow = {
-            context.coordinator.attemptSetup(view: view)
-        }
-        context.coordinator.attemptSetup(view: view)
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.attemptSetup(view: nsView)
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(isAtBottom: $isAtBottom)
-    }
-
-    class Coordinator: NSObject {
-        @Binding var isAtBottom: Bool
-        private var isSetUp = false
-        private var retryCount = 0
-
-        init(isAtBottom: Binding<Bool>) {
-            _isAtBottom = isAtBottom
-        }
-
-        /// The underlying NSScrollView (backing SwiftUI's List) may not be in the
-        /// view hierarchy when makeNSView / viewDidMoveToWindow fire. Retry with a
-        /// short delay so the observer attaches reliably; otherwise isAtBottom
-        /// stays at its initial value (true) forever and auto-scroll never stops.
-        func attemptSetup(view: NSView) {
-            guard !isSetUp else { return }
-            if let scrollView = view.enclosingScrollView ?? Self.findScrollView(from: view) {
-                isSetUp = true
-                scrollView.contentView.postsBoundsChangedNotifications = true
-                NotificationCenter.default.addObserver(
-                    self,
-                    selector: #selector(scrollViewDidScroll(_:)),
-                    name: NSView.boundsDidChangeNotification,
-                    object: scrollView.contentView
-                )
-                return
-            }
-            guard retryCount < 30 else { return }
-            retryCount += 1
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak view] in
-                guard let self, let view else { return }
-                self.attemptSetup(view: view)
-            }
-        }
-
-        /// Walk up the view hierarchy and search sibling subtrees for an NSScrollView
-        /// whose document view is an NSTableView (i.e., the List's backing scroll view).
-        private static func findScrollView(from view: NSView) -> NSScrollView? {
-            var current: NSView? = view.superview
-            while let parent = current {
-                if let found = findTableScrollView(in: parent) { return found }
-                current = parent.superview
-            }
-            return nil
-        }
-
-        private static func findTableScrollView(in view: NSView) -> NSScrollView? {
-            if let sv = view as? NSScrollView, sv.documentView is NSTableView { return sv }
-            for subview in view.subviews {
-                if let found = findTableScrollView(in: subview) { return found }
-            }
-            return nil
-        }
-
-        @objc func scrollViewDidScroll(_ notification: Notification) {
-            guard let clipView = notification.object as? NSClipView,
-                  let scrollView = clipView.enclosingScrollView,
-                  let documentView = scrollView.documentView else { return }
-            let contentHeight = documentView.frame.height
-            let visibleHeight = clipView.bounds.height
-            let scrollOffset = clipView.bounds.origin.y
-            let distanceFromBottom: CGFloat
-            if documentView.isFlipped {
-                distanceFromBottom = contentHeight - scrollOffset - visibleHeight
-            } else {
-                distanceFromBottom = scrollOffset
-            }
-            // Update synchronously on main so a subsequent onChange(liveSegments)
-            // observes the new value. A main.async update can lose the race and
-            // cause auto-scroll to snap back to bottom even after the user scrolled up.
-            let atBottom = distanceFromBottom <= 150
-            if Thread.isMainThread {
-                if isAtBottom != atBottom { isAtBottom = atBottom }
-            } else {
-                DispatchQueue.main.async {
-                    if self.isAtBottom != atBottom { self.isAtBottom = atBottom }
-                }
-            }
-        }
-
-        deinit {
-            NotificationCenter.default.removeObserver(self)
-        }
-    }
-}
 
 // MARK: - Window Configurator
 
@@ -435,70 +230,6 @@ private struct WindowConfigurator: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
-// MARK: - Window Drag Overlay
-
-/// Transparent overlay that lets single-finger click+drag move the window
-/// while forwarding two-finger trackpad scroll events to the List beneath.
-private struct WindowDragOverlay: NSViewRepresentable {
-    class DragView: NSView {
-        weak var targetScrollView: NSScrollView?
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            DispatchQueue.main.async { [weak self] in
-                self?.targetScrollView = self?.findScrollView()
-            }
-        }
-
-        /// Pass hit-tests through to views beneath when the point is over a
-        /// visible scrollbar. Without this, clicks on the scrollbar start a
-        /// window drag (via mouseDown below) instead of letting the scroller
-        /// handle them.
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            if targetScrollView == nil { targetScrollView = findScrollView() }
-            if let scrollView = targetScrollView,
-               let scroller = scrollView.verticalScroller,
-               !scroller.isHidden,
-               scroller.alphaValue > 0.01,
-               let superview = superview {
-                let pointInScroller = scroller.convert(point, from: superview)
-                if scroller.bounds.contains(pointInScroller) {
-                    return nil
-                }
-            }
-            return super.hitTest(point)
-        }
-
-        override func mouseDown(with event: NSEvent) {
-            window?.performDrag(with: event)
-        }
-
-        override func scrollWheel(with event: NSEvent) {
-            if targetScrollView == nil { targetScrollView = findScrollView() }
-            targetScrollView?.scrollWheel(with: event)
-        }
-
-        private func findScrollView() -> NSScrollView? {
-            var current: NSView? = superview
-            while let parent = current {
-                if let sv = Self.findTableScrollView(in: parent) { return sv }
-                current = parent.superview
-            }
-            return nil
-        }
-
-        private static func findTableScrollView(in view: NSView) -> NSScrollView? {
-            if let sv = view as? NSScrollView, sv.documentView is NSTableView { return sv }
-            for sub in view.subviews {
-                if let found = findTableScrollView(in: sub) { return found }
-            }
-            return nil
-        }
-    }
-
-    func makeNSView(context: Context) -> NSView { DragView() }
-    func updateNSView(_ nsView: NSView, context: Context) {}
-}
 
 // MARK: - Pulsing Animation
 

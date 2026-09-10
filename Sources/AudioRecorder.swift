@@ -77,6 +77,10 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         pcmState.withLock { $0.trimOffset + $0.buffer.count }
     }
 
+    var oldestAvailableSample: Int {
+        pcmState.withLock { $0.trimOffset }
+    }
+
     private static let zoomBundleIDs: Set<String> = ["us.zoom.xos", "us.zoom.videomeeting"]
 
     // MARK: - Live Transcription PCM Access
@@ -816,6 +820,14 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         let resampled = Array(UnsafeBufferPointer(start: outputChannel, count: Int(outputBuffer.frameLength)))
         pcmState.withLock { state in
             state.buffer.append(contentsOf: resampled)
+            // Bound memory even if model loading/inference stalls or live text is disabled.
+            // The full recording is written independently through AVAssetWriter.
+            let maximum = 16000 * 90
+            if state.buffer.count > maximum {
+                let drop = max(16000, state.buffer.count - maximum)
+                state.buffer.removeFirst(drop)
+                state.trimOffset += drop
+            }
         }
     }
 
