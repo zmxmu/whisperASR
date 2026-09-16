@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 /// One selectable document. Disjoint paragraph edits preserve unaffected selections.
-/// Selecting changing text or selecting all pauses presentation, never capture/inference.
+/// Character-level patches track selections through recognition corrections without pausing.
 struct LiveTranscriptTextView: NSViewRepresentable {
     let segments: [TranscriptionSegment]
     let translations: [String]
@@ -12,8 +12,6 @@ struct LiveTranscriptTextView: NSViewRepresentable {
     // Optional producer hint. Skipped revisions always fall back to exact comparisons.
     var sourceRevision: UInt64? = nil
     var dirtyFrom: Int? = nil
-    var resumeRequest: UInt64 = 0
-    var onPauseChanged: ((Bool) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -64,7 +62,6 @@ struct LiveTranscriptTextView: NSViewRepresentable {
 
     final class SelectionTextView: NSTextView {
         var isSelecting = false
-        var explicitlyPaused = false
         weak var transcriptCoordinator: Coordinator?
         var selectionInteractionEnded: (() -> Void)?
 
@@ -75,14 +72,8 @@ struct LiveTranscriptTextView: NSViewRepresentable {
             selectionInteractionEnded?()
         }
 
-        override func selectAll(_ sender: Any?) {
-            explicitlyPaused = (textStorage?.length ?? 0) > 0
-            super.selectAll(sender)
-            selectionInteractionEnded?()
-        }
-
         override func cancelOperation(_ sender: Any?) {
-            transcriptCoordinator?.resumeLive(sender)
+            setSelectedRange(NSRange(location: selectedRange().location, length: 0))
         }
 
         override func menu(for event: NSEvent) -> NSMenu? {
@@ -101,9 +92,6 @@ struct LiveTranscriptTextView: NSViewRepresentable {
         private var applying = false
         private var appliedFontSize: TranscriptFontSize?
         private var appliedTranslationOnly: Bool?
-        private var lastResumeRequest: UInt64 = 0
-        private var forceFollow = false
-        private(set) var isPaused = false
 
         enum CopyKind { case original, translation, timestamped }
 
@@ -116,9 +104,6 @@ struct LiveTranscriptTextView: NSViewRepresentable {
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard !applying else { return }
-            if textView?.selectedRanges.allSatisfy({ $0.rangeValue.length == 0 }) == true {
-                textView?.explicitlyPaused = false
-            }
             // Do not mutate text storage during AppKit's selection notification.
             DispatchQueue.main.async { [weak self] in self?.renderPending() }
         }
@@ -128,51 +113,34 @@ struct LiveTranscriptTextView: NSViewRepresentable {
                   let next = pending, let storage = text.textStorage else { return }
             applying = true
             defer { applying = false }
-            if lastResumeRequest != next.resumeRequest {
-                lastResumeRequest = next.resumeRequest
-                clearPause(text)
-                forceFollow = true
-            }
             let modeChanged = appliedTranslationOnly != nil
                 && appliedTranslationOnly != next.translationOnly
             // A deliberate display-mode change takes effect immediately. A font change,
             // however, only changes attributes and keeps the current character selection.
-            if modeChanged { clearPause(text) }
+            if modeChanged { text.setSelectedRange(NSRange(location: text.selectedRange().location, length: 0)) }
             let scroll = text.enclosingScrollView
             let origin = scroll?.contentView.bounds.origin ?? .zero
             let visible = scroll?.documentVisibleRect ?? .zero
             var ranges = text.selectedRanges.map(\.rangeValue)
             let selections = ranges.filter { $0.length > 0 }
-            let follow = selections.isEmpty && (forceFollow || storage.length == 0
+            let follow = selections.isEmpty && (storage.length == 0
                 || text.bounds.maxY - visible.maxY < 40)
             if appliedFontSize != next.fontSize {
                 storage.addAttribute(.font, value: Self.font(next.fontSize),
                                      range: NSRange(location: 0, length: storage.length))
                 appliedFontSize = next.fontSize
             }
-            if text.explicitlyPaused {
-                setPaused(true)
-                return
-            }
             if let old = rendered, old.revision == next.revision, !modeChanged {
-                setPaused(false)
-                if forceFollow { text.scrollRangeToVisible(NSRange(location: storage.length, length: 0)) }
-                forceFollow = false
                 return
             }
 
             let edits = paragraphEdits(from: rendered, to: next, modeChanged: modeChanged)
-            guard edits.allSatisfy({ edit in
-                selections.allSatisfy { selection in
-                    if edit.range.length == 0 {
-                        return !(selection.location < edit.range.location
-                            && edit.range.location < NSMaxRange(selection))
-                    }
-                    return NSIntersectionRange(selection, edit.range).length == 0
-                }
-            }) else {
-                setPaused(true)
-                return
+            // If an earlier paragraph changes height, keep the selected text at the
+            // same screen position rather than merely preserving the scroll offset.
+            let anchorIndex = ranges.firstIndex { $0.length > 0 }
+            let anchorY: CGFloat? = anchorIndex.flatMap { index in
+                edits.contains { $0.range.location < ranges[index].location }
+                    ? Self.characterY(ranges[index].location, in: text) : nil
             }
 
             // Descending edits keep all old UTF-16 positions valid, even when an earlier
@@ -180,16 +148,12 @@ struct LiveTranscriptTextView: NSViewRepresentable {
             storage.beginEditing()
             for edit in edits.reversed() {
                 let delta = edit.replacement.length - edit.range.length
-                ranges = ranges.map { range in
-                    if range.location >= NSMaxRange(edit.range) {
-                        return NSRange(location: range.location + delta, length: range.length)
-                    }
-                    if range.length == 0, range.location > edit.range.location {
-                        return NSRange(location: edit.range.location, length: 0)
-                    }
-                    return range
-                }
-                storage.replaceCharacters(in: edit.range, with: edit.replacement)
+                // Preserve unchanged characters even inside a changed paragraph (e.g.
+                // translation appended below a selected original, or one corrected word).
+                let patch = modeChanged ? (edit.range, edit.replacement)
+                    : Self.characterPatch(storage: storage, range: edit.range, replacement: edit.replacement)
+                ranges = ranges.map { Self.mapSelection($0, through: patch.0, replacementLength: patch.1.length) }
+                storage.replaceCharacters(in: patch.0, with: patch.1)
                 var end = edit.range.location
                 let ends = edit.lengths.map { length -> Int in end += length; return end }
                 offsets.replaceSubrange((edit.oldIndices.lowerBound + 1)..<(edit.oldIndices.upperBound + 1), with: ends)
@@ -203,14 +167,24 @@ struct LiveTranscriptTextView: NSViewRepresentable {
                                    affinity: text.selectionAffinity, stillSelecting: false)
             rendered = next
             appliedTranslationOnly = next.translationOnly
-            setPaused(false)
-            forceFollow = false
             if follow {
                 text.scrollRangeToVisible(NSRange(location: storage.length, length: 0))
             } else if let scroll {
-                scroll.contentView.scroll(to: origin)
+                var target = origin
+                if let anchorY, let index = anchorIndex, ranges[index].length > 0,
+                   let newY = Self.characterY(ranges[index].location, in: text) {
+                    target.y += newY - anchorY
+                }
+                scroll.contentView.scroll(to: target)
                 scroll.reflectScrolledClipView(scroll.contentView)
             }
+        }
+
+        private static func characterY(_ location: Int, in text: NSTextView) -> CGFloat? {
+            guard location < (text.textStorage?.length ?? 0),
+                  let layout = text.layoutManager, let container = text.textContainer else { return nil }
+            let glyphs = layout.glyphRange(forCharacterRange: NSRange(location: location, length: 1), actualCharacterRange: nil)
+            return layout.boundingRect(forGlyphRange: glyphs, in: container).minY
         }
 
         private func paragraphEdits(from old: LiveTranscriptTextView?, to next: LiveTranscriptTextView,
@@ -279,26 +253,47 @@ struct LiveTranscriptTextView: NSViewRepresentable {
             return result
         }
 
-        private func setPaused(_ value: Bool) {
-            guard isPaused != value else { return }
-            isPaused = value
-            // Updating a SwiftUI binding synchronously from updateNSView is not allowed.
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.isPaused == value else { return }
-                self.pending?.onPauseChanged?(value)
+        /// Trim common grapheme clusters, never splitting emoji/surrogate pairs.
+        private static func characterPatch(storage: NSTextStorage, range: NSRange,
+                                           replacement: NSAttributedString) -> (NSRange, NSAttributedString) {
+            let old = Array((storage.string as NSString).substring(with: range))
+            let new = Array(replacement.string)
+            var prefix = 0, prefixLength = 0
+            while prefix < min(old.count, new.count),
+                  String(old[prefix]).utf16.elementsEqual(String(new[prefix]).utf16) {
+                prefixLength += String(old[prefix]).utf16.count
+                prefix += 1
             }
+            var suffix = 0, suffixLength = 0
+            while suffix < min(old.count, new.count) - prefix,
+                  String(old[old.count - suffix - 1]).utf16.elementsEqual(String(new[new.count - suffix - 1]).utf16) {
+                suffixLength += String(old[old.count - suffix - 1]).utf16.count
+                suffix += 1
+            }
+            let changed = NSRange(location: range.location + prefixLength,
+                                  length: range.length - prefixLength - suffixLength)
+            let inserted = replacement.attributedSubstring(from: NSRange(location: prefixLength,
+                length: replacement.length - prefixLength - suffixLength))
+            return (changed, inserted)
         }
 
-        private func clearPause(_ text: SelectionTextView) {
-            text.explicitlyPaused = false
-            text.setSelectedRange(NSRange(location: min(text.selectedRange().location, text.string.utf16.count), length: 0))
-        }
-
-        @objc func resumeLive(_ sender: Any?) {
-            guard let text = textView else { return }
-            clearPause(text)
-            forceFollow = true
-            renderPending()
+        /// Insertions at the selection end stay outside it (including Cmd+A + append).
+        /// Corrections inside a selection remain selected; deleted selections collapse.
+        static func mapSelection(_ selection: NSRange, through edit: NSRange,
+                                 replacementLength: Int) -> NSRange {
+            let delta = replacementLength - edit.length
+            func map(_ position: Int, end: Bool) -> Int {
+                if edit.length == 0 {
+                    return position > edit.location || (position == edit.location && !end)
+                        ? position + delta : position
+                }
+                if position <= edit.location { return position }
+                if position >= NSMaxRange(edit) { return position + delta }
+                return edit.location + (end ? replacementLength : 0)
+            }
+            let start = map(selection.location, end: false)
+            let end = selection.length == 0 ? start : map(NSMaxRange(selection), end: true)
+            return NSRange(location: start, length: max(0, end - start))
         }
 
         func copyText(_ kind: CopyKind) -> String {
@@ -344,8 +339,7 @@ struct LiveTranscriptTextView: NSViewRepresentable {
             for (title, action) in [
                 ("Copy Selected Paragraphs — Original", #selector(copyOriginal(_:))),
                 ("Copy Selected Paragraphs — Translation", #selector(copyTranslation(_:))),
-                ("Copy Selected Paragraphs with Timestamps", #selector(copyTimestamped(_:))),
-                ("Resume Live Updates", #selector(resumeLive(_:)))
+                ("Copy Selected Paragraphs with Timestamps", #selector(copyTimestamped(_:)))
             ] {
                 let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
                 item.target = self
@@ -355,7 +349,6 @@ struct LiveTranscriptTextView: NSViewRepresentable {
         }
 
         func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-            if menuItem.action == #selector(resumeLive(_:)) { return isPaused }
             if menuItem.action == #selector(copyOriginal(_:)) { return !copyText(.original).isEmpty }
             if menuItem.action == #selector(copyTranslation(_:)) { return !copyText(.translation).isEmpty }
             if menuItem.action == #selector(copyTimestamped(_:)) { return !copyText(.timestamped).isEmpty }

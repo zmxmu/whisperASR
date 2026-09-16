@@ -44,28 +44,26 @@ struct LiveTranscriptChecks {
         precondition(text.selectedRange() == selection)
         precondition((text.string as NSString).substring(with: selection) == selectedText)
 
-        // A translation for a selected segment would rewrite the selected text itself:
-        // that update waits until the selection is cleared, then catches up.
-        let frozenHistory = text.string
+        // Translations inserted inside a multi-paragraph selection appear immediately.
         translations = ["Translated first sentence"]
         refresh()
-        precondition(text.string == frozenHistory && text.selectedRange() == selection)
+        precondition(text.selectedRange().length > selection.length)
         text.setSelectedRange(NSRange(location: 0, length: 0))
         coordinator.renderPending()
         precondition(text.string.contains("Translated first sentence\n"))
         precondition(text.string.hasSuffix("新增 tail\n"))
         precondition(text.string.hasPrefix(segments[0].text + "\nTranslated first sentence\n" + segments[1].text + "\n"))
 
-        // A selection reaching into the live tail freezes the document until it is cleared.
+        // Corrections intersecting the selection appear immediately and keep a valid selection.
         let tailLocation = (text.string as NSString).range(of: "新增 tail").location
         // Start on "。\n" so the range does not split the preceding emoji cluster.
         let tailSelection = NSRange(location: tailLocation - 2, length: 6)
         text.setSelectedRange(tailSelection)
         precondition(text.selectedRange() == tailSelection)
-        let frozenTail = text.string
         segments[segments.count - 1] = TranscriptionSegment(start: 3600, end: 3601, text: "changed tail")
         refresh()
-        precondition(text.string == frozenTail && text.selectedRange() == tailSelection)
+        precondition(text.string.hasSuffix("changed tail\n") && text.selectedRange().length > 0)
+        precondition(NSMaxRange(text.selectedRange()) <= text.string.utf16.count)
         text.setSelectedRange(NSRange(location: 0, length: 0))
         coordinator.renderPending()
         precondition(text.string.hasSuffix("changed tail\n"))
@@ -123,9 +121,10 @@ struct LiveTranscriptChecks {
         translations = []
         refresh()
         precondition(text.string.isEmpty)
-        print("PASS: read-only, history selection survives tail updates, tail-overlapping selection freezes and catches up, drag freeze, scroll preservation, translations, style, truncation, empty document")
+        print("PASS: read-only, history selection survives tail updates, selected corrections remain live, gesture catch-up, scroll preservation, translations, style, truncation, empty document")
         print("PASS: 100 tail updates with 3,601 segments: \(elapsed); maximum edited range before full-replacement cases < 100 UTF-16 units")
         checkInteractionBoundaries()
+        checkCharacterCorrections()
         checkMountedEmptySnapshot()
     }
 
@@ -137,14 +136,13 @@ struct LiveTranscriptChecks {
         ]
         var translations = ["translation A", "translation B", "translation C"]
         var revision: UInt64 = 0
-        var resumeRequest: UInt64 = 0
         var only = false
         var size = TranscriptFontSize.normal
         let coordinator = LiveTranscriptTextView.Coordinator()
         func snapshot(source: UInt64? = nil, dirty: Int? = nil) -> LiveTranscriptTextView {
             LiveTranscriptTextView(segments: segments, translations: translations,
                                    revision: revision, fontSize: size, translationOnly: only,
-                                   sourceRevision: source, dirtyFrom: dirty, resumeRequest: resumeRequest)
+                                   sourceRevision: source, dirtyFrom: dirty)
         }
         let scroll = snapshot().makeScrollView(coordinator: coordinator)
         scroll.frame = NSRect(x: 0, y: 0, width: 600, height: 100)
@@ -163,7 +161,7 @@ struct LiveTranscriptChecks {
         translations[0] = "A much longer translation 👋"
         segments.append(TranscriptionSegment(start: 3664, end: 3665, text: "new D"))
         refresh()
-        precondition(!coordinator.isPaused && text.string.hasSuffix("new D\n"))
+        precondition(text.string.hasSuffix("new D\n"))
         precondition((text.string as NSString).substring(with: text.selectedRange()) == chosen)
         precondition(coordinator.copyText(.original) == segments[1].text)
         precondition(coordinator.copyText(.translation) == "translation B")
@@ -178,7 +176,7 @@ struct LiveTranscriptChecks {
         precondition((text.textStorage!.attribute(.font, at: beforeFont.location, effectiveRange: nil) as? NSFont)?.pointSize == 15)
         only = true
         refresh()
-        precondition(text.selectedRange().length == 0 && !coordinator.isPaused)
+        precondition(text.selectedRange().length == 0)
         precondition(text.string == translations.joined(separator: "\n") + "\n")
         only = false
         refresh()
@@ -194,37 +192,30 @@ struct LiveTranscriptChecks {
         precondition(abs(scroll.contentView.bounds.origin.y - readingOrigin.y) < 1)
         precondition((text.string as NSString).substring(with: text.selectedRange()) == "尾部 C")
 
-        // Cmd+A always freezes a snapshot, including pure append. Copy actions use
-        // rendered source metadata, not the newest pending recognition.
+        // Cmd+A does not freeze updates, and pure appends do not expand the selection.
         text.selectAll(nil)
-        let frozen = text.string
-        let frozenSource = coordinator.copyText(.original)
         segments[0] = TranscriptionSegment(start: 1, end: 2, text: "changed pending A")
         segments.append(TranscriptionSegment(start: 3666, end: 3667, text: "append while all selected"))
         refresh()
-        precondition(coordinator.isPaused && text.string == frozen)
-        precondition(coordinator.copyText(.original) == frozenSource)
-        resumeRequest &+= 1
-        refresh()
-        precondition(!coordinator.isPaused && text.selectedRange().length == 0)
+        precondition(text.string.hasPrefix("changed pending A\n"))
+        precondition(coordinator.copyText(.original).hasPrefix("changed pending A"))
+        precondition(!coordinator.copyText(.original).contains("append while all selected"))
         precondition(text.string.hasSuffix("append while all selected\n"))
         text.selectAll(nil)
         segments.append(TranscriptionSegment(start: 3667, end: 3668, text: "pure append"))
         let beforeAppend = text.string
+        let beforeAppendSelection = text.selectedRange()
         refresh()
-        precondition(coordinator.isPaused && text.string == beforeAppend)
+        precondition(text.string == beforeAppend + "pure append\n")
+        precondition(text.selectedRange() == beforeAppendSelection)
         text.cancelOperation(nil)
-        precondition(!coordinator.isPaused && text.string.hasSuffix("pure append\n"))
+        precondition(text.selectedRange().length == 0 && text.string.hasSuffix("pure append\n"))
 
-        // Empty provisional recognition must retain the selectable document until
-        // deselection, then safely catch up to an empty storage and offset table.
+        // Deleting selected provisional text updates immediately and collapses the selection.
         text.selectAll(nil)
-        let beforeEmpty = text.string
         segments = []
         translations = []
         refresh()
-        precondition(coordinator.isPaused && text.string == beforeEmpty)
-        coordinator.resumeLive(nil)
         precondition(text.string.isEmpty && text.selectedRange() == NSRange(location: 0, length: 0))
 
         // A stale producer hint must not skip an earlier translation after a missed
@@ -244,12 +235,60 @@ struct LiveTranscriptChecks {
         let menu = NSMenu()
         coordinator.addTranscriptActions(to: menu)
         coordinator.addTranscriptActions(to: menu)
-        precondition(menu.items.count == 5, "Reused context menus must not accumulate duplicate actions")
+        precondition(menu.items.count == 4, "Reused context menus must not accumulate duplicate actions")
         precondition(menu.items.contains { $0.title == "Copy Selected Paragraphs — Original" })
         precondition(menu.items.contains { $0.title == "Copy Selected Paragraphs — Translation" })
         precondition(menu.items.contains { $0.title == "Copy Selected Paragraphs with Timestamps" })
-        precondition(menu.items.contains { $0.title == "Resume Live Updates" })
-        print("PASS: disjoint translation edits, frozen-source copy/timestamps, font/mode changes, selected-history scroll, Cmd+A pure-append pause, Resume/Escape, empty catch-up, revision hint fallback, context actions")
+        precondition(!menu.items.contains { $0.title.contains("Resume") || $0.title.contains("Pause") })
+        print("PASS: disjoint translation edits, live copy/timestamps, font/mode changes, selected-history scroll, Cmd+A with live appends, Escape, empty updates, revision hint fallback, no pause actions")
+    }
+
+    @MainActor private static func checkCharacterCorrections() {
+        let coordinator = LiveTranscriptTextView.Coordinator()
+        var revision: UInt64 = 0
+        func snapshot(_ value: String) -> LiveTranscriptTextView {
+            LiveTranscriptTextView(segments: [TranscriptionSegment(start: 0, end: 1, text: value)],
+                                   translations: [], revision: revision, fontSize: .normal, translationOnly: false)
+        }
+        let scroll = snapshot("").makeScrollView(coordinator: coordinator)
+        scroll.frame = NSRect(x: 0, y: 0, width: 600, height: 200)
+        let text = coordinator.textView!
+        func update(_ value: String) {
+            revision += 1
+            coordinator.pending = snapshot(value)
+            coordinator.renderPending()
+        }
+        update("中文 👩🏽‍💻 keep bad suffix")
+        text.setSelectedRange((text.string as NSString).range(of: "keep"))
+        update("中文 👩🏽‍💻 keep corrected suffix")
+        precondition((text.string as NSString).substring(with: text.selectedRange()) == "keep")
+        text.setSelectedRange((text.string as NSString).range(of: "corrected"))
+        update("中文 👩🏽‍💻 keep good suffix")
+        precondition((text.string as NSString).substring(with: text.selectedRange()) == "good")
+        text.selectAll(nil)
+        // Canonically equivalent graphemes have different UTF-16 lengths.
+        update("e\u{301} 👩🏽‍💻 selected")
+        text.setSelectedRange((text.string as NSString).range(of: "selected"))
+        update("é 👩🏽‍💻 selected")
+        precondition((text.string as NSString).substring(with: text.selectedRange()) == "selected")
+        precondition(text.string == "é 👩🏽‍💻 selected\n")
+
+        for start in 0...12 {
+            for end in start...12 {
+                for editStart in 0...12 {
+                    for editEnd in editStart...12 {
+                        for inserted in [0, 1, 7] {
+                            let mapped = LiveTranscriptTextView.Coordinator.mapSelection(
+                                NSRange(location: start, length: end - start),
+                                through: NSRange(location: editStart, length: editEnd - editStart), replacementLength: inserted)
+                            precondition(mapped.location >= 0 && mapped.length >= 0)
+                            precondition(NSMaxRange(mapped) <= 12 - (editEnd - editStart) + inserted)
+                        }
+                    }
+                }
+            }
+        }
+        print("PASS: word corrections, unchanged selected substring, Unicode normalization/emoji, exhaustive selection-range bounds")
     }
 
     @MainActor private static func checkMountedEmptySnapshot() {
@@ -278,12 +317,12 @@ struct LiveTranscriptChecks {
                                                   fontSize: .normal, translationOnly: false)
         settle()
         precondition(findText(hosting) === text)
-        precondition(text.string == "provisional first sentence\n" && text.selectedRange().length > 0)
+        precondition(text.string.isEmpty && text.selectedRange().length == 0)
         text.cancelOperation(nil)
         settle()
         precondition(text.string.isEmpty && findText(hosting) === text)
         window.close()
-        print("PASS: mounted SwiftUI document survives empty recognition while selected and clears after Resume")
+        print("PASS: mounted SwiftUI document updates empty recognition even while selected")
     }
 
     final class EditProbe: NSObject, NSTextStorageDelegate {

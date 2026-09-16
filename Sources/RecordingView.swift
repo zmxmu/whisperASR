@@ -158,8 +158,6 @@ private struct LiveTranscriptPane: View {
     @Environment(AppState.self) private var appState
     @AppStorage("transcriptFontSize") private var transcriptFontSizeRaw = TranscriptFontSize.normal.rawValue
     @State private var hasShownText = false
-    @State private var displayPaused = false
-    @State private var resumeRequest: UInt64 = 0
     let translationOnly: Bool
 
     private var fontSize: TranscriptFontSize { TranscriptFontSize(rawValue: transcriptFontSizeRaw) ?? .normal }
@@ -173,7 +171,7 @@ private struct LiveTranscriptPane: View {
                 errorBanner(message: message, tint: .orange)
             }
             // Keep the native document alive even when a provisional first result is
-            // removed. Its coordinator can then preserve a selected, frozen snapshot.
+            // removed. Its coordinator can then update the same selectable document.
             ZStack {
                 LiveTranscriptTextView(
                     segments: appState.liveSegments,
@@ -182,11 +180,9 @@ private struct LiveTranscriptPane: View {
                     fontSize: fontSize,
                     translationOnly: translationOnly,
                     sourceRevision: appState.liveTextSourceRevision,
-                    dirtyFrom: appState.liveTextDirtyFrom,
-                    resumeRequest: resumeRequest,
-                    onPauseChanged: { displayPaused = $0 }
+                    dirtyFrom: appState.liveTextDirtyFrom
                 )
-                .help("⌘C copies selected text. ⌘A pauses the displayed snapshot. Right-click to copy original, translation, or timestamped paragraphs. Click outside the selection, press Escape, or Resume to continue.")
+                .help("Select across lines and press ⌘C to copy. New text keeps arriving while selected. Recognition corrections update the selected text too. Right-click for original, translation, or timestamped paragraphs.")
 
                 if appState.isLiveTranscribing && appState.liveSegments.isEmpty && !hasShownText {
                     HStack(spacing: 6) {
@@ -197,18 +193,6 @@ private struct LiveTranscriptPane: View {
                     }
                     .allowsHitTesting(false)
                 }
-            }
-            if displayPaused {
-                HStack(spacing: 8) {
-                    Text("Display paused — recording continues")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Resume") { resumeRequest &+= 1 }
-                        .controlSize(.small)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
