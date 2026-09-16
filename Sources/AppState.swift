@@ -443,13 +443,17 @@ class AppState {
                 if session == liveSessionID { isLiveTranscribing = false }
             }
             do {
+                var waitingSince: ContinuousClock.Instant?
                 while !Task.isCancelled, session == liveSessionID {
                     do {
                         try await service.preloadModel()
                         break
                     } catch let error as TranscriptionExecutionError where Self.isWaitingForService(error) {
                         if finishRequested { liveNeedsFilePass = true; return }
-                        liveError = "Waiting for the transcription service. Audio recording continues."
+                        let began = waitingSince ?? .now
+                        waitingSince = began
+                        if began.duration(to: .now) >= .seconds(30) { throw error }
+                        liveError = "【请稍候，无需重新抓取】识别服务忙，正在自动重试；录音继续。"
                         try await Task.sleep(for: .seconds(1))
                     }
                 }
@@ -459,7 +463,7 @@ class AppState {
             } catch {
                 guard session == liveSessionID, !Task.isCancelled else { return }
                 liveNeedsFilePass = true
-                liveError = "Couldn't load transcription model: \(error.localizedDescription)"
+                liveError = Self.liveFailureMessage(error)
             }
         }
     }
@@ -470,6 +474,8 @@ class AppState {
         var lastEmptyAvailableEnd: Int?
         var firstEmptyAvailableEnd: Int?
         var inferenceDuration = 0.0
+        var inferenceFailures = 0
+        var waitingSince: ContinuousClock.Instant?
         defer {
             // A terminal repair transition stops the periodic loop. Persist its last
             // draft now even if the normal 15-second checkpoint is not due yet.
@@ -501,7 +507,7 @@ class AppState {
                 from: assembler.tailStart, maximumCount: Self.maxChunkSamples)
             if snapshot.wasEvicted && assembler.sealedSampleCount < snapshot.oldest {
                 liveNeedsFilePass = true
-                liveError = "Transcription fell behind; missing audio will be transcribed from the saved recording."
+                liveError = "【结束录音后等待补转；下次可选择更小模型】识别跟不上音频，部分内容将尝试从保存的录音补转。"
                 if firstEmptyAvailableEnd != nil, !assembler.displayedTail.isEmpty {
                     // Capture may outrun the retry budget while inference is suspended.
                     // Do not erase the retained draft when its PCM is no longer present.
@@ -538,6 +544,8 @@ class AppState {
                 if samples.count < 16000 { samples += Array(repeating: 0, count: 16000 - samples.count) }
                 let result = try await service.transcribeChunk(samples: samples, language: language)
                 guard !Task.isCancelled, liveSessionID == session else { return }
+                inferenceFailures = 0
+                waitingSince = nil
                 if finalWindow && result.segments.isEmpty && !assembler.displayedTail.isEmpty {
                     // A voiced final window without decoder output is not proof of silence.
                     // Preserve the displayed draft and repair from the durable audio file.
@@ -579,7 +587,7 @@ class AppState {
                     } ?? false
                     if finishRequested || retryBudgetExhausted {
                         liveNeedsFilePass = true
-                        liveError = "Live inference stopped because the draft could not be confirmed. Audio recording continues; the saved audio will be transcribed after recording."
+                        liveError = "【请结束录音保存，再重新抓取音频】多次识别仍无法确认临时文字，实时识别已停止；录音继续，结束后将尝试补转。"
                         break
                     }
                     firstEmptyAvailableEnd = firstEmptyAvailableEnd ?? snapshot.availableEnd
@@ -589,7 +597,9 @@ class AppState {
                     lastEmptyAvailableEnd = nil
                 }
                 publishLive(publication)
-                if !liveNeedsFilePass { liveError = nil }
+                liveError = liveNeedsFilePass
+                    ? "【结束录音后等待补转；下次可选择更小模型】实时识别已继续，但此前缺失的内容仍需尝试从保存的录音补转。"
+                    : nil
                 recorder.trimSamples(upTo: assembler.tailStart)
                 throttledAutoSave()
                 enqueueLiveTranslation()
@@ -597,13 +607,28 @@ class AppState {
             } catch let error as TranscriptionExecutionError where Self.isWaitingForService(error) {
                 guard !Task.isCancelled, liveSessionID == session else { return }
                 if finishRequested { liveNeedsFilePass = true; break }
-                liveError = "Waiting for the transcription service. Audio recording continues."
+                let began = waitingSince ?? .now
+                waitingSince = began
+                if began.duration(to: .now) >= .seconds(30) {
+                    liveNeedsFilePass = true
+                    liveError = Self.liveFailureMessage(error)
+                    break
+                }
+                liveError = "【请稍候，无需重新抓取】识别服务忙，正在自动重试；录音继续。"
                 try? await Task.sleep(for: .seconds(1))
                 continue
             } catch {
                 guard !Task.isCancelled, liveSessionID == session else { return }
+                // A decoder return code means the native call has actually returned.
+                // Retry the uncommitted audio twice; never retry a still-running timed-out C call.
+                if case TranscriptionError.decoderFailed = error, inferenceFailures < 2 {
+                    inferenceFailures += 1
+                    liveError = "【请稍候，无需重新抓取】识别暂时失败，正在自动重试（\(inferenceFailures)/2）；录音继续。"
+                    try? await Task.sleep(for: .seconds(Double(inferenceFailures)))
+                    continue
+                }
                 liveNeedsFilePass = true
-                liveError = "Live inference stopped: \(error.localizedDescription). The saved audio will be transcribed after recording."
+                liveError = Self.liveFailureMessage(error)
                 // A timed-out native call may still own the GPU. Do not queue retries or
                 // pretend that missing PCM is silence. Final filing takes the full-file path.
                 break
@@ -639,6 +664,20 @@ class AppState {
         case .busy, .queuedTimedOut: return true
         case .timedOut: return false
         }
+    }
+
+    nonisolated static func liveFailureMessage(_ error: Error) -> String {
+        let suggestion: String
+        if error is TranscriptionExecutionError {
+            suggestion = "请先结束录音保存；若有文件/API转录任务，请等待其完成后重新抓取，仍无响应再重启应用"
+        } else if case TranscriptionError.modelNotFound = error {
+            suggestion = "请在设置中下载或重新选择模型，再重新抓取音频"
+        } else if case TranscriptionError.processFailed = error {
+            suggestion = "请检查模型文件及语言设置，必要时重新下载模型，再重新抓取音频"
+        } else {
+            suggestion = "请结束录音保存后重新抓取；反复失败时换用较小模型或重启应用"
+        }
+        return "【\(suggestion)】实时识别无法继续；录音继续，结束后将尝试从录音补转。原因：\(error.localizedDescription)"
     }
 
     /// Cancel discards the current session; Finish uses the drain path above instead.
@@ -815,7 +854,7 @@ class AppState {
             guard !target.isEmpty else { return }
             if let previous = liveTranslationLanguage, previous != target {
                 translationAuthPaused = true
-                liveTranslationError = "Translation language changed. Start a new recording to avoid mixed-language results."
+                liveTranslationError = "【请结束本次录音，再重新抓取】翻译目标语言已改变，为避免混合语言结果，本次翻译已停止。原文识别继续。"
                 return
             }
             liveTranslationLanguage = target
@@ -840,7 +879,7 @@ class AppState {
                     segmentTexts: texts, targetLanguage: target, previousTranslations: context)
                 guard translationWorkerIsCurrent(epoch) else { return }
                 guard UserDefaults.standard.string(forKey: "targetLanguage") == target else {
-                    liveTranslationError = "Translation language changed. Restart translation in a new recording to avoid mixed-language results."
+                    liveTranslationError = "【请结束本次录音，再重新抓取】翻译目标语言已改变，本次翻译已停止。原文识别继续。"
                     translationAuthPaused = true
                     return
                 }
@@ -870,13 +909,22 @@ class AppState {
                     switch error {
                     case .authFailed, .invalidEndpoint, .unavailable:
                         translationAuthPaused = true
-                        liveTranslationError = error.errorDescription
+                        liveTranslationError = "【请检查翻译 API 地址、密钥及权限，修正后重新抓取】翻译配置不可用，原文识别继续。原因：\(error.localizedDescription)"
+                        return
+                    case .apiFailed:
+                        translationAuthPaused = true
+                        liveTranslationError = "【请检查翻译 API 模型名称、参数及配额，修正后重新抓取；无需重启应用】接口拒绝请求，已停止重复提交。原文识别继续。原因：\(error.localizedDescription)"
                         return
                     default: break
                     }
                 }
                 translationFailureCount = min(translationFailureCount + 1, 32)
-                if translationFailureCount >= 3 { liveTranslationError = error.localizedDescription }
+                if translationFailureCount >= 5 {
+                    translationAuthPaused = true
+                    liveTranslationError = "【请检查网络、API 配额和模型配置，恢复后重新抓取；无需重启应用】翻译连续失败 5 轮，已停止重试，原文识别继续。原因：\(error.localizedDescription)"
+                    return
+                }
+                liveTranslationError = "【请稍候，正在自动重试；无需重新抓取】翻译暂时失败（\(translationFailureCount)/5），原文识别继续。原因：\(error.localizedDescription)"
             }
         }
     }

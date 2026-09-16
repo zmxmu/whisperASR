@@ -121,7 +121,7 @@ final class TranscriptionService: @unchecked Sendable {
         }
         try cancellation.checkCancellation()
         guard result == 0 else {
-            throw TranscriptionError.processFailed("whisper_full returned error \(result)")
+            throw TranscriptionError.decoderFailed(result)
         }
 
         let detected = detectedLanguage(in: ctx)

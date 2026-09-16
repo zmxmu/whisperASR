@@ -208,7 +208,8 @@ private struct LiveTranscriptPane: View {
             Text(message)
                 .font(.caption)
                 .foregroundStyle(.primary)
-                .lineLimit(2)
+                .lineLimit(4)
+                .help(message)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12)

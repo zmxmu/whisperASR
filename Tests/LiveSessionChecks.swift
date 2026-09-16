@@ -11,6 +11,7 @@ private actor ServiceScenario {
     var holdPreload = false
     var holdFirstChunk = false
     var failChunk: Int?
+    var decoderFailures = 0
     var busyChunk: Int?
     var queuedTimeoutChunk: Int?
     var firstResultIsShort = false
@@ -49,6 +50,7 @@ private actor ServiceScenario {
     func releaseFirstChunk() { firstChunk?.resume(); firstChunk = nil }
     func preloadIsWaiting() -> Bool { preload != nil }
     func chunkCount() -> Int { chunks.count }
+    func setDecoderFailures(_ count: Int) { decoderFailures = count }
     func recordedChunks() -> [[Float]] { chunks }
     func fileCount() -> Int { files.count }
     func decodeBudgetFailureCount() -> Int { decodeBudgetFailures }
@@ -62,6 +64,10 @@ private actor ServiceScenario {
             throw TranscriptionError.processFailed("Fixture decode-call budget exceeded")
         }
         chunks.append(samples)
+        if decoderFailures > 0 {
+            decoderFailures -= 1
+            throw TranscriptionError.decoderFailed(-1)
+        }
         if index == 0 && holdFirstChunk {
             // Deliberately ignore Task cancellation: AppState's session/epoch guards
             // must reject late results even from a non-cooperative dependency.
@@ -122,10 +128,16 @@ private actor ServiceScenario {
 
 private actor TranslationScenario {
     var requests: [[String]] = []
+    var failuresRemaining = 0
+    func setFailures(_ count: Int) { failuresRemaining = count }
     private var waiting: [Int: CheckedContinuation<[String], Error>] = [:]
     func translate(_ texts: [String]) async throws -> [String] {
         let index = requests.count
         requests.append(texts)
+        if failuresRemaining > 0 {
+            failuresRemaining -= 1
+            throw TranslationError.transient
+        }
         return try await withCheckedThrowingContinuation { waiting[index] = $0 }
     }
     func count() -> Int { requests.count }
@@ -220,6 +232,7 @@ final class APIServer {
 
 enum TranslationError: LocalizedError {
     case authFailed, invalidEndpoint, unavailable, transient
+    case apiFailed(String)
     var errorDescription: String? { "Test translation error" }
 }
 enum TranslationService {
@@ -234,9 +247,9 @@ enum TranslationService {
 struct LiveSessionChecks {
     private static var directory: URL!
 
-    private static func eventually(_ message: String,
+    private static func eventually(_ message: String, timeout: Double = 5,
                                    condition: () async -> Bool) async throws {
-        let limit = ContinuousClock.now.advanced(by: .seconds(5))
+        let limit = ContinuousClock.now.advanced(by: .seconds(timeout))
         while !(await condition()) {
             precondition(ContinuousClock.now < limit, message)
             try await Task.sleep(for: .milliseconds(10))
@@ -273,6 +286,10 @@ struct LiveSessionChecks {
         try await drainLongRecording()
         try await fullWindowDoesNotStall()
         try await timedOutLiveUsesFullFile()
+        try await decoderRetryRecovery(exhausted: false)
+        try await decoderRetryRecovery(exhausted: true)
+        try await translationRetryRecovery(exhausted: false)
+        try await translationRetryRecovery(exhausted: true)
         try await emptyFinalPreservesDraft(overlapOnly: false)
         try await emptyFinalPreservesDraft(overlapOnly: true)
         try await emptyFinalBackgroundNoiseDoesNotRepair()
@@ -355,6 +372,50 @@ struct LiveSessionChecks {
         precondition(recorder.stopCalls == 0)
         await state.finishRecording(recorder: recorder)
         precondition(state.items[0].segments.last?.end == 32)
+    }
+
+    private static func translationRetryRecovery(exhausted: Bool) async throws {
+        let (state, recorder, _) = makeSession(exhausted ? "translation-retry-limit" : "translation-retry-recovery")
+        let translation = StubEnvironment.translation
+        await translation.setFailures(exhausted ? 10 : 1)
+        state.enableLiveTranslation = true
+        recorder.buffer.append(speech(10) + silent(0.5))
+        state.startLiveTranscription(recorder: recorder)
+        if exhausted {
+            try await eventually("Translation retries were not bounded", timeout: 12) {
+                state.liveTranslationError?.contains("连续失败 5 轮") == true
+            }
+            let attempts = await translation.count()
+            precondition(attempts == 5 && state.isLiveTranscribing)
+            precondition(state.liveTranslationError?.hasPrefix("【请检查网络") == true)
+        } else {
+            try await eventually("Translation was not retried") { await translation.count() == 2 }
+            await translation.complete(1, prefix: "RECOVERED")
+            try await eventually("Translation retry did not publish") { !state.liveTranslatedSegments.isEmpty }
+            precondition(state.liveTranslationError == nil && state.isLiveTranscribing)
+        }
+        state.stopLiveTranscription()
+    }
+
+    private static func decoderRetryRecovery(exhausted: Bool) async throws {
+        let (state, recorder, service) = makeSession(exhausted ? "decoder-exhausted" : "decoder-recovered")
+        await service.setDecoderFailures(exhausted ? 3 : 1)
+        recorder.buffer.append(speech(10) + silent(0.5))
+        state.startLiveTranscription(recorder: recorder)
+        if exhausted {
+            try await eventually("Decoder retries did not stop after the budget") { !state.isLiveTranscribing }
+            let attempts = await service.chunkCount()
+            precondition(attempts == 3)
+            precondition(state.liveError?.hasPrefix("【请结束录音保存后重新抓取") == true)
+            state.stopLiveTranscription()
+        } else {
+            try await eventually("Transient decoder error did not recover") { !state.liveSegments.isEmpty }
+            precondition(state.liveError == nil)
+            await state.finishRecording(recorder: recorder)
+            precondition(state.items[0].status == .completed)
+            let repairs = await service.fileCount()
+            precondition(repairs == 0, "Successful retry must not schedule file repair")
+        }
     }
 
     private static func timedOutLiveUsesFullFile() async throws {
@@ -547,7 +608,7 @@ struct LiveSessionChecks {
         precondition(recorder.state == .recording && recorder.stopCalls == 0
                      && recorder.accumulatedSampleCount < 90 * 16000,
                      "Inference must stop safely while durable recording continues, before PCM cap eviction")
-        precondition(state.liveError?.localizedCaseInsensitiveContains("saved") == true,
+        precondition(state.liveError?.contains("补转") == true,
                      "No-progress degradation must explain the saved-audio repair path")
         recorder.buffer.append(Array(repeating: Float(0.002), count: 16000))
         try await Task.sleep(for: .milliseconds(350))

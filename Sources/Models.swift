@@ -120,11 +120,13 @@ enum TranscriptionStatus: Equatable {
 // MARK: - Errors
 
 enum TranscriptionError: LocalizedError {
+    case decoderFailed(Int32)
     case processFailed(String)
     case modelNotFound(String)
 
     var errorDescription: String? {
         switch self {
+        case .decoderFailed(let code): return "Transcription failed: whisper_full returned error \(code)"
         case .processFailed(let msg): return "Transcription failed: \(msg)"
         case .modelNotFound(let msg): return msg
         }
