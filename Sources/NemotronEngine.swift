@@ -30,7 +30,9 @@ actor NemotronEngine {
     /// ("zh-TW", "ja", "auto", nil = auto-detect).
     func transcribe(samples: [Float],
                     language: String?,
-                    onProgress: (@Sendable (Double) -> Void)? = nil) async throws -> TranscriptionResult {
+                    onProgress: (@Sendable (Double) -> Void)? = nil,
+                    cancellation: TranscriptionCancellation? = nil) async throws -> TranscriptionResult {
+        try cancellation?.checkCancellation()
         guard let manager else {
             throw TranscriptionError.processFailed("Nemotron model not loaded")
         }
@@ -41,6 +43,7 @@ actor NemotronEngine {
         let sliceSamples = 5 * 16_000
         var offset = 0
         while offset < samples.count {
+            try cancellation?.checkCancellation()
             let end = min(offset + sliceSamples, samples.count)
             _ = try await manager.process(samples: Array(samples[offset..<end]))
             offset = end
@@ -51,11 +54,17 @@ actor NemotronEngine {
         }
 
         let (text, timings) = try await manager.finishWithTokenTimings()
+        try cancellation?.checkCancellation()
         let detected = await manager.detectedLanguage()
         await manager.reset()
 
         var segments = Self.makeSegments(from: timings)
-        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let chinese = Self.baseLanguageCode(detected) == "zh" || language == "zh"
+        func normalize(_ text: String) -> String {
+            chinese ? (text.applyingTransform(StringTransform("Traditional-Simplified"), reverse: false) ?? text) : text
+        }
+        let trimmedText = normalize(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        segments = segments.map { TranscriptionSegment(start: $0.start, end: $0.end, text: normalize($0.text)) }
         if segments.isEmpty && !trimmedText.isEmpty {
             segments = [TranscriptionSegment(start: 0,
                                              end: Double(samples.count) / 16_000.0,

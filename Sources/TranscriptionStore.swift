@@ -62,7 +62,8 @@ enum TranscriptionStore {
 
     // MARK: - Save
 
-    static func save(_ item: TranscriptionItem) {
+    @discardableResult
+    static func save(_ item: TranscriptionItem) -> Bool {
         ensureDirectory()
 
         let statusTag: String
@@ -94,8 +95,14 @@ enum TranscriptionStore {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(stored) else { return }
-        try? data.write(to: fileURL(for: item.id), options: .atomic)
+        do {
+            let data = try encoder.encode(stored)
+            try data.write(to: fileURL(for: item.id), options: .atomic)
+            return true
+        } catch {
+            print("[TranscriptionStore] Save failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     // MARK: - Load

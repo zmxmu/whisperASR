@@ -1,0 +1,18 @@
+请在本会话执行 whisperasr-0.6.2-R3 定向复核（请求 ID 同名），保持 Fable 5.1 / Extra。
+仓库 /Users/min.zheng/Documents/github/whisperASR，HEAD/base 仍为 95edefce6ac790c1beba8652b6dd903991ed8e99；未提交源码以 .build/reviews/round-3-manifest.txt 的32项 SHA-256 为准。开始/结束均核对该清单。R2 原始完整结论在 docs/reviews/claude-R2.txt。只读源码，可安全编译/运行检查；不改源码、不commit/push、不安装/退出应用、不读取用户音频/密钥。
+例外授权：请将本轮完整原始最终审查答复写入 /Users/min.zheng/Documents/github/whisperASR/.build/reviews/round-3-response.txt，便于 Codex 无损读取。只允许新建这一个审查结果文件（不要覆盖其他轮次），它不是源码。也请在本会话给出最终结论。其他探针仍放你的 scratchpad。
+
+本轮只改 AppState 与 Tests/LiveSessionChecks；所有其他源码/原生执行器/解码参数保持R2指纹。请聚焦 R2 的两个问题及相邻回归，不必重复已经完成的全量审查。
+
+重新检查状态转换后，未采用直接skip丢掉草稿或直接封口不确定文本的建议。明确策略：
+1. 第一轮 retained-empty 保留草稿，继续按 latest-empty availableEnd 的新音频门控重试。
+2. 连续 retained-empty 自第一次 snapshot.availableEnd 以来新增至少12s音频后停止live（实际输出恢复则重置预算）。此时明确banner，录音继续保存，之后Finish将完整文件排队修复。保留已有草稿和已译sealed前缀，不把不确定内容当完成文本。
+3. await返回后使用当前finishRequested，若已Finish且keptDraftAfterEmpty立即break转文件修复，禁止对非final的同一30s backlog无限decode。已有final空/仅lookbehind处理仍保留。
+4. 已经进入retained-empty等待时若90s cap先淘汰所需音频，直接repair退出保留draft，不再skip清空。
+5. terminal repair退出时强制提交一次恢复文件快照（不等15s）；翻译worker晚于live结束时也flush当前revision。已有串行恢复queue确保Finish删除在保存之后。
+
+Tests/LiveSessionChecks 使用真实 AppState/assembler/PCM；服务是有限次数桩，预算越界抛fixture错误防止旧bug无限耗CPU，但PASS必须零越界。新覆盖：13s语音+45s持续空noise+Finish有界；active首次空后+5s仍活跃、再+7s到12s停止推理且保留draft/译文；恢复输出重置等待预算；等待中100s音频突发导致cap也保留draft/恢复文件。旧单次empty/onlyoverlap恢复、纯噪声final、busy/queued恢复、翻译保存、短尾与正常长积压路径仍保留。
+
+Codex已swift build、按项目要求重新swift run &启动；四组独立检查需你再运行核对。原生C/Metal源码本轮无变化，R2实际Large v3 Turbo+合成英语的正常/取消/超时/恢复smoke以及TSan已通过。未宣称真实Breeze-ASR-25会议识别率、长会话功耗或macOS14兼容已验证。
+
+请独立用你的R2复现重新证明进展，不只看新增测试；特别关注 lateFinish、no-new-audio、budget reset、cap抢先发生、保存/翻译并发顺序。有确定问题给严重度/位置/最小复现/建议；没有则明确R2两项是否解决、当前指纹源码是否已无阻挡本机安装的问题。请记录实际测试、首尾哈希核对，不把桩每秒调用数说成真实模型吞吐量。

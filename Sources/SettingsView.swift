@@ -8,6 +8,7 @@ struct SettingsView: View {
     @AppStorage("translationEndpoint") private var translationEndpoint = ""
     @AppStorage("translationAPIKey") private var translationAPIKey = ""
     @AppStorage("translationModel") private var translationModel = ""
+    @AppStorage(RecognitionLanguageMode.defaultsKey) private var recognitionLanguageMode = RecognitionLanguageMode.mandarinEnglish.rawValue
 
     @AppStorage(DiarizationService.useRemoteKey) private var diarizationUseRemote = false
     /// The voice library has no observable store, so the list is snapshotted when
@@ -69,7 +70,24 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("OpenAI API") {
+            Section("Speech Recognition") {
+                Picker("Spoken Language", selection: $recognitionLanguageMode) {
+                    ForEach(RecognitionLanguageMode.allCases, id: \.rawValue) { mode in
+                        Text(mode.label).tag(mode.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text((RecognitionLanguageMode(rawValue: recognitionLanguageMode) ?? .mandarinEnglish).helpText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Text("Applies to file imports and live recordings. It guides the currently selected model and never switches models. API requests continue to use their own language field.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("OpenAI API (Translation & Meeting Minutes)") {
                 TextField("API Endpoint", text: $translationEndpoint,
                           prompt: Text("https://api.openai.com/v1"))
                     .textFieldStyle(.roundedBorder)
@@ -303,7 +321,7 @@ struct SettingsView: View {
                     EmptyView()
                 }
 
-                Text("Saves your settings (model choice, translation API config, font size, recent apps) to one file. On a new Mac, copy your Recordings and Transcriptions folders into ~/Library/Application Support/WhisperASR/ — transcripts load from there and audio links repair automatically — then restore your settings here. The file includes your translation API key, so keep it private.")
+                Text("Saves your settings (model and recognition language choices, translation API config, font size, recent apps) to one file. On a new Mac, copy your Recordings and Transcriptions folders into ~/Library/Application Support/WhisperASR/ — transcripts load from there and audio links repair automatically — then restore your settings here. The file includes your translation API key, so keep it private.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

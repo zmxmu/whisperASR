@@ -1,0 +1,68 @@
+Claude Desktop Code 实际审查正文（仅合并界面拆分的行与排版）
+任务：音频转文字性能优化 / whisperASR
+模型与 effort：Fable 5.1 / Extra
+请求：whisperasr-0.6.2-R1
+目标：HEAD 95edefce6ac790c1beba8652b6dd903991ed8e99 上的未提交修复，32 文件清单。
+
+审查结论（whisperasr-0.6.2-R1）
+
+有一个阻挡本机安装的确定问题，另有一个强烈建议修完再装的确定回退。其余为中低风险。清单复核通过，我没有改动任何源文件。
+
+核对情况：
+- HEAD 为 95edefce…，清单 32 个文件 SHA-256 全部匹配（开始与结束各核对一次）。
+- swift build 通过。四组独立检查全部通过（LiveAudio、TranscriptionCancellation、LiveTranscript、LiveSession）。
+- 审查期间工作区新出现未跟踪文件 docs/reviews/0.6.2.md，是 Codex 的修复记录，不在清单内，未作为源码审查。
+- 我的复现脚本全部放在会话 scratchpad，未写入项目目录。
+
+发现（按严重度）
+
+1. 确定，阻挡：强制封口的浮点边界比较会让整段文本永久丢失
+
+位置：LiveTranscriptionAssembler.swift:87-92 用 sample(at:) 把段落 end 四舍五入成样本数作为 newSeal，第 98 行再用 end <= sealTime（Double(newSeal)/16000）决定哪些段落进入 sealedSegments。两者相差一个 ulp 时，定义封口点的那一段被判为“未封口”，但音频游标已经越过它。第 66-67 行的 complete.last?.end 路径有同样问题。
+
+后果：下一轮从 tailStart（封口点前 1 秒）解码，只能得到该段的最后 1 秒残片。publishLive 从 replacingFrom = sealedCount 起替换显示尾部，该段完整文本从 liveSegments 消失，且其音频已在封口之后，永不重转。liveNeedsFilePass 不会置位，条目按 completed 归档。
+
+复现：用真实 assembler 遍历 30473 组（非整秒窗口起点 × whisper 厘秒时间戳），3045 组出现“游标已过 B 但 B 未封口”，随后一轮全部丢失 B。示例 start=1, t1=1305cs：两轮后可见文本为 ["A","C"]。现有测试全部用整秒边界，所以没有覆盖到。真实录音里窗口起点几乎总是非整秒，而噪声底高于 0.001 时每次封口都是强制封口，因此约十分之一的强制封口会丢一段。
+
+最小修复：在样本域比较。
+let newlySealedCount = final ? tail.count
+    : tail.prefix { $0.end.map { Self.sample(at: $0) <= newSeal } ?? false }.count
+
+第 61 行的 complete 同样改为 Self.sample(at: end) <= cut。补一条非整秒起点的回归用例（例如上面的 start=1、t1=1305）。风险低，只影响边界判定。
+
+2. 确定，建议阻挡：liveNeedsFilePass 触发过宽，完整实时文本被降级重转、已完成翻译被丢弃
+
+三处代码：AppState.swift:490-495 最终窗口解码为空即置位；514-519 非最终轮次只要 publication 为空且之前有草稿即置位，并且仍会 publishLive 空结果把草稿从屏幕上抹掉；212-224 重转分支创建条目时没有带上 translatedSegments/translationLanguage。
+
+用 LiveSessionChecks 的桩环境加真实 AppState 复现了三个场景：
+- 一句话已封口，随后 2 秒 RMS 0.002 的背景噪声，点 Finish：状态变为 transcribing，弹出 “Live transcription was incomplete”，排队整文件重转。
+- 中途一次非最终解码返回空段：草稿从 13 段缩到 12 段，之后即便解码恢复，Finish 仍走重转。
+- 上述场景开启翻译：归档条目 translatedSegments = []，translationLanguage = nil。
+
+0.6.1 在这些情况下按 completed 保存并保留翻译。触发概率取决于音源噪声底：会议软件静音段可能低于门限，但 YouTube、播客、带底噪的房间音都会高于 0.001，这时每次 Finish 都会触发。
+
+最小修复：最终窗口为空时只在 !assembler.displayedTail.isEmpty 时置位；非最终轮次 publication 为空时不发布、不置位，保留草稿等下一轮；重转分支把翻译一并写入条目（文件重转完成后对齐会失效，可在替换时清空并提示）。
+
+3. 确定，中高：排队等待造成的超时或 busy 被当作 GPU 挂死，永久停止实时转写
+
+CancellationSupport.swift:172-176 在 submit 之前就启动期限计时，排队等待计入超时。AppState.swift:525-531 对任何错误一律 break 并置位重转。场景：录音期间向主窗口拖入一个文件，或 API 服务收到请求，文件推理占用 GPU 数分钟，实时 chunk 排在后面 60 秒超时，之后整个录音再无实时文本。0.6.1 的同类超时只提示“slow”并继续。
+
+最小修复：TypedTranscriptionJob.run 取走 operation 时在 TranscriptionCancellation 记录 started，超时错误区分“未开始就到期”与“执行中到期”。runLiveLoop 对未开始的超时和 .busy 做休眠重试（可限次数），只有执行中的超时才走 break。
+
+4. 假设，低：Finish 排空期间通过 URL 再次开始录音会破坏状态
+
+WhisperASRApp.swift:174-176 无条件把状态置为 .ready 并调用 startRecording，后者在 AudioRecorder.swift:203 清空正在被排空的 PCM，排空提前结束但不会置位重转。随后 AppState.swift:242 把新录音的状态覆盖为 .idle。UI 路径被 .saving 状态挡住，只有 URL 自动化能触发。修复：finishRecording 末尾仅在状态仍为 .saving 时才置 .idle，handleURL 在 isFinishingRecording 期间延后。
+
+5. 确定，低（性能）：实时循环在主 actor 上，每 200 毫秒轮询都完整拷贝尾窗 PCM
+
+AppState.swift:453-454 每次迭代先取快照再判断是否需要解码，等待期间也在复制最多 1.9 MB。建议先用 accumulatedSampleCount 做门控再取快照。不阻挡。
+
+已核实无问题的重点项：
+- 右键菜单：探针确认 NSTextView.menu(for:) 每次返回新实例，不会污染其他文本框的共享菜单。
+- 文本视图的不相交编辑、UTF-16 选区平移、⌘A 冻结与 Resume、始终挂载的空文档，逻辑正确。
+- 封口历史不回滚：publishLive 与 skip 都只从 sealedCount 起替换。
+- 翻译 epoch、session 守卫、3 秒收尾、恢复文件失败保留、录音回调 gate 与原子 PCM 快照，均未发现漏洞。
+- 未实测项：Escape 触发 cancelOperation 的真实键路径，首次 Metal 编译下 60 秒预加载期限是否够用。macOS 14 兼容性不能据本机构建断言。
+
+阻挡判断：
+问题 1 阻挡安装。问题 2 是相对 0.6.1 的数据与体验回退，建议一并修完再构建 0.6.2。问题 3 建议同批修复。问题 4、5 可留到下一轮。

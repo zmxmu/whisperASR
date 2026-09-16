@@ -1,70 +1,49 @@
 import Foundation
 import CWhisper
+import os
 
 final class TranscriptionService: @unchecked Sendable {
     private var ctx: OpaquePointer?
     private var loadedModelPath: String?
-    /// Dedicated context for the live-transcription model, loaded only when the
-    /// user picked a live model different from the main one. Both contexts can
-    /// coexist so a file transcription (big model) and live chunks (small model)
-    /// interleaving on the queue don't reload models on every alternation.
     private var liveCtx: OpaquePointer?
     private var loadedLiveModelPath: String?
-    /// Serial queue to ensure only one whisper_full() runs at a time (ctx is not thread-safe).
-    private let whisperQueue = DispatchQueue(label: "com.whisperasr.whisper", qos: .userInitiated)
-    /// Core ML / ANE engine for Nemotron model bundles (directory models).
     private let nemotron = NemotronEngine()
-    /// True while a live session runs on the Nemotron engine — blocks the
-    /// "unload nemotron when file-transcribing with whisper" eviction below.
+    private let nemotronQueue = CancellableTranscriptionQueue(label: "com.whisperasr.nemotron")
     private let liveStateLock = NSLock()
     private var liveNemotronActive = false
-
-    /// Which engine the currently selected model runs on.
     private enum ResolvedEngine {
         case whisper(path: String)
         case nemotron(directory: String)
     }
-
-    /// Whisper models are single files; Nemotron bundles are directories.
-    private func resolveEngine() -> ResolvedEngine {
-        Self.engine(forPath: resolveModelPath())
-    }
-
-    /// Engine for the live-transcription model selection.
-    private func resolveLiveEngine() -> ResolvedEngine {
-        Self.engine(forPath: resolveLiveModelPath())
-    }
-
+    private func resolveEngine() -> ResolvedEngine { Self.engine(forPath: resolveModelPath()) }
+    private func resolveLiveEngine() -> ResolvedEngine { Self.engine(forPath: resolveLiveModelPath()) }
     private static func engine(forPath path: String) -> ResolvedEngine {
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+        var directory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: path, isDirectory: &directory), directory.boolValue {
             return .nemotron(directory: path)
         }
         return .whisper(path: path)
     }
+    var liveModelDiffers: Bool { resolveLiveModelPath() != resolveModelPath() }
+    private let processExitRequested = OSAllocatedUnfairLock(initialState: false)
+    private let fileRequestsInFlight = OSAllocatedUnfairLock(initialState: 0)
+    /// Serial queue to ensure only one whisper_full() runs at a time (ctx is not thread-safe).
+    private let whisperQueue = CancellableTranscriptionQueue(label: "com.whisperasr.whisper")
 
     deinit {
-        if let ctx { whisper_free(ctx) }
-        if let liveCtx { whisper_free(liveCtx) }
+        // A running worker retains self. Outside process termination, deinit can
+        // therefore only release ctx after the last physical C operation returns.
+        if !processExitRequested.withLock({ $0 }), let ctx { whisper_free(ctx) }
+        if !processExitRequested.withLock({ $0 }), let liveCtx { whisper_free(liveCtx) }
     }
 
     func shutdown() {
-        unloadLiveModel()
-        unloadWhisper()
-        Task { await self.nemotron.unload() }
-    }
-
-    /// Serialize with any in-flight whisper_full; if the process exits before
-    /// this runs the OS reclaims the context anyway. Frees only the main
-    /// context — a live session's dedicated context stays loaded.
-    private func unloadWhisper() {
-        whisperQueue.async {
-            if let ctx = self.ctx {
-                whisper_free(ctx)
-                self.ctx = nil
-                self.loadedModelPath = nil
-            }
-        }
+        // Termination only: do not block the main thread on an unresponsive GPU,
+        // and do not enqueue a free that could race process/Metal teardown. Leave
+        // the context alive for process reclamation; this is NOT a model-unload API.
+        processExitRequested.withLock { $0 = true }
+        whisperQueue.shutdown()
+        nemotronQueue.shutdown()
     }
 
     /// Free the live session's resources when recording ends: the dedicated
@@ -77,7 +56,7 @@ final class TranscriptionService: @unchecked Sendable {
             return was
         }
 
-        whisperQueue.async {
+        whisperQueue.scheduleCleanup {
             if let liveCtx = self.liveCtx {
                 whisper_free(liveCtx)
                 self.liveCtx = nil
@@ -85,7 +64,10 @@ final class TranscriptionService: @unchecked Sendable {
             }
         }
         if wasNemotron, case .whisper = resolveEngine() {
-            Task { await self.nemotron.unload() }
+            Task { try? await self.nemotronQueue.performAsync(timeoutSeconds: 60) { cancellation in
+                try cancellation.checkCancellation()
+                await self.nemotron.unload()
+            } }
         }
     }
 
@@ -95,191 +77,191 @@ final class TranscriptionService: @unchecked Sendable {
                     language: String? = nil,
                     translate: Bool = false,
                     onProgress: @escaping @Sendable (Double) -> Void) async throws -> TranscriptionResult {
+        try Task.checkCancellation()
+        // Bound decoded-file retention too: admission checks alone would let many
+        // concurrent HTTP requests all start loading PCM before any one queues.
+        let admitted = fileRequestsInFlight.withLock { count -> Bool in
+            guard count < 2 else { return false }
+            count += 1
+            return true
+        }
+        guard admitted else { throw TranscriptionExecutionError.busy }
+        defer { fileRequestsInFlight.withLock { $0 -= 1 } }
+        let engine = resolveEngine()
+        switch engine {
+        case .whisper: try whisperQueue.checkAvailability()
+        case .nemotron: try nemotronQueue.checkAvailability()
+        }
         let samples = try await AudioLoader.loadSamples(url: fileURL)
-
-        if case .nemotron(let directory) = resolveEngine() {
+        try Task.checkCancellation()
+        if case .nemotron(let directory) = engine {
             guard !translate else {
-                throw TranscriptionError.processFailed(
-                    "Translation to English is not supported by the Nemotron model. Select a Whisper model instead."
-                )
+                throw TranscriptionError.processFailed("Translation to English requires a Whisper model.")
             }
-            unloadWhisper()  // free the main whisper ctx (a live session's context stays)
-            try await nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory, isDirectory: true))
-            return try await nemotron.transcribe(samples: samples, language: language, onProgress: onProgress)
-        }
-        let keepNemotron = liveStateLock.withLock { liveNemotronActive }  // live session is using it
-        if !keepNemotron {
-            Task { await self.nemotron.unload() }
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            self.whisperQueue.async {
-                let ctx: OpaquePointer
-                do {
-                    ctx = try self.ensureModelLoaded()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                var (params, langCStr) = self.makeBaseParams(language: language, translate: translate)
-                defer { free(langCStr) }
-
-                // Progress callback
-                let progressPtr = Unmanaged.passRetained(ProgressBox(handler: onProgress)).toOpaque()
-                params.progress_callback_user_data = progressPtr
-                params.progress_callback = { (_: OpaquePointer?, _: OpaquePointer?, progress: Int32, userData: UnsafeMutableRawPointer?) in
-                    guard let userData else { return }
-                    let box = Unmanaged<ProgressBox>.fromOpaque(userData).takeUnretainedValue()
-                    let value = Double(progress) / 100.0
-                    DispatchQueue.main.async {
-                        box.handler(value)
-                    }
-                }
-
-                // Run transcription
-                let result = samples.withUnsafeBufferPointer { buf in
-                    whisper_full(ctx, params, buf.baseAddress, Int32(buf.count))
-                }
-
-                // Release progress box
-                Unmanaged<ProgressBox>.fromOpaque(progressPtr).release()
-
-                if result != 0 {
-                    continuation.resume(throwing: TranscriptionError.processFailed("whisper_full returned error \(result)"))
-                    return
-                }
-
-                // Extract segments
-                let nSegments = whisper_full_n_segments(ctx)
-                var segments: [TranscriptionSegment] = []
-                var fullText = ""
-
-                for i in 0..<nSegments {
-                    let t0 = whisper_full_get_segment_t0(ctx, i)  // centiseconds (10ms units)
-                    let t1 = whisper_full_get_segment_t1(ctx, i)
-                    let text: String
-                    if let cStr = whisper_full_get_segment_text(ctx, i) {
-                        text = String(cString: cStr)
-                    } else {
-                        text = ""
-                    }
-
-                    segments.append(TranscriptionSegment(
-                        start: Double(t0) / 100.0,  // convert centiseconds → seconds
-                        end: Double(t1) / 100.0,
-                        text: text
-                    ))
-                    fullText += text
-                }
-
-                // Whisper's auto-detected language for the audio.
-                var detected: String? = nil
-                let langId = whisper_full_lang_id(ctx)
-                if langId >= 0, let langPtr = whisper_lang_str(langId) {
-                    detected = String(cString: langPtr)
-                }
-
-                continuation.resume(returning: TranscriptionResult(
-                    text: fullText,
-                    segments: segments,
-                    detectedLanguage: detected
-                ))
+            whisperQueue.scheduleCleanup {
+                if let ctx = self.ctx { whisper_free(ctx) }
+                self.ctx = nil
+                self.loadedModelPath = nil
             }
+            return try await nemotronQueue.performAsync(timeoutSeconds: max(60, Double(samples.count) / 16000 * 4)) { cancellation in
+                try cancellation.checkCancellation()
+                try await self.nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory))
+                return try await self.nemotron.transcribe(samples: samples, language: language,
+                    onProgress: onProgress, cancellation: cancellation)
+            }
+        }
+        if !liveStateLock.withLock({ liveNemotronActive }) {
+            // Keep disposal serialized with Core ML operations as well: an actor
+            // alone can re-enter during load/process awaits.
+            Task { try? await self.nemotronQueue.performAsync(timeoutSeconds: 60) { cancellation in
+                try cancellation.checkCancellation()
+                if !self.liveStateLock.withLock({ self.liveNemotronActive }) {
+                    await self.nemotron.unload()
+                }
+            } }
+        }
+        return try await whisperQueue.perform(timeoutSeconds: max(60, Double(samples.count) / 16000 * 4)) { cancellation in
+            try self.runTranscription(samples: samples, language: language,
+                                      translate: translate, threadCount: nil,
+                                      cancellation: cancellation, onProgress: onProgress)
         }
     }
 
     // MARK: - Chunk Transcription (Live/Streaming)
 
     /// Transcribe raw 16kHz mono PCM Float32 samples directly (used for live transcription during recording).
-    /// Uses the live model selection (falling back to the main model) and runs on a background queue.
-    func transcribeChunk(samples: [Float]) async throws -> TranscriptionResult {
+    /// This reuses the already-loaded whisper model and runs on a background queue.
+    func transcribeChunk(samples: [Float], language: String? = nil,
+                         timeoutSeconds: TimeInterval? = nil) async throws -> TranscriptionResult {
+        try Task.checkCancellation()
         guard !samples.isEmpty else {
             return TranscriptionResult(text: "", segments: [])
         }
 
+        let timeout = timeoutSeconds ?? max(60, Double(samples.count) / 16000 * 4)
         if case .nemotron(let directory) = resolveLiveEngine() {
-            try await nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory, isDirectory: true))
-            return try await nemotron.transcribeChunk(samples: samples)
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            self.whisperQueue.async {
-                let ctx: OpaquePointer
-                do {
-                    ctx = try self.ensureLiveModelLoaded()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                let liveThreads = min(4, max(1, Int32(ProcessInfo.processInfo.activeProcessorCount / 4)))
-                let (params, langCStr) = self.makeBaseParams(threadCount: liveThreads)
-                defer { free(langCStr) }
-
-                let result = samples.withUnsafeBufferPointer { buf in
-                    whisper_full(ctx, params, buf.baseAddress, Int32(buf.count))
-                }
-
-                if result != 0 {
-                    continuation.resume(throwing: TranscriptionError.processFailed("whisper_full returned error \(result)"))
-                    return
-                }
-
-                let nSegments = whisper_full_n_segments(ctx)
-                var segments: [TranscriptionSegment] = []
-                var fullText = ""
-
-                for i in 0..<nSegments {
-                    let t0 = whisper_full_get_segment_t0(ctx, i)
-                    let t1 = whisper_full_get_segment_t1(ctx, i)
-                    let text: String
-                    if let cStr = whisper_full_get_segment_text(ctx, i) {
-                        text = String(cString: cStr)
-                    } else {
-                        text = ""
-                    }
-
-                    segments.append(TranscriptionSegment(
-                        start: Double(t0) / 100.0,
-                        end: Double(t1) / 100.0,
-                        text: text
-                    ))
-                    fullText += text
-                }
-
-                continuation.resume(returning: TranscriptionResult(
-                    text: fullText,
-                    segments: segments
-                ))
+            return try await nemotronQueue.performAsync(timeoutSeconds: timeout) { cancellation in
+                try cancellation.checkCancellation()
+                try await self.nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory))
+                return try await self.nemotron.transcribe(samples: samples, language: language,
+                    cancellation: cancellation)
             }
+        }
+        return try await whisperQueue.perform(timeoutSeconds: timeout) { cancellation in
+            let liveThreads = min(4, max(1, Int32(ProcessInfo.processInfo.activeProcessorCount / 4)))
+            return try self.runTranscription(samples: samples, language: language,
+                                            translate: false, threadCount: liveThreads,
+                                            cancellation: cancellation, onProgress: nil, live: true)
         }
     }
 
-    /// Ensure the live-transcription model is loaded (pre-loading at recording
-    /// start, to avoid model loading latency on the first chunk). Waits for any
-    /// queued transcription, then loads.
-    func preloadLiveModel() async throws {
-        switch resolveLiveEngine() {
-        case .whisper:
-            liveStateLock.withLock { liveNemotronActive = false }
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                whisperQueue.async {
-                    do {
-                        _ = try self.ensureLiveModelLoaded()
-                        continuation.resume()
-                    } catch {
-                        continuation.resume(throwing: error)
-                    }
+    /// Ensure the whisper model is loaded (public access for pre-loading during recording start).
+    /// Cancellation/timeout resumes the caller even if model loading cannot be interrupted.
+    /// The model operation still owns the serial slot until its C call really returns.
+    func preloadModel() async throws {
+        if case .nemotron(let directory) = resolveLiveEngine() {
+            liveStateLock.withLock { liveNemotronActive = true }
+            try await nemotronQueue.performAsync(timeoutSeconds: 60) { cancellation in
+                try cancellation.checkCancellation()
+                try await self.nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory))
+            }
+            return
+        }
+        liveStateLock.withLock { liveNemotronActive = false }
+        try await whisperQueue.perform(timeoutSeconds: 60) { cancellation in
+            try cancellation.checkCancellation()
+            _ = try self.ensureLiveModelLoaded()
+            try cancellation.checkCancellation()
+        }
+    }
+
+    private func runTranscription(samples: [Float], language: String?, translate: Bool,
+                                  threadCount: Int32?, cancellation: TranscriptionCancellation,
+                                  onProgress: (@Sendable (Double) -> Void)?, live: Bool = false) throws -> TranscriptionResult {
+        try cancellation.checkCancellation()
+        let ctx = try live ? ensureLiveModelLoaded() : ensureModelLoaded()
+        try cancellation.checkCancellation()
+        try validateLanguage(language, for: ctx)
+
+        var (params, langCStr) = makeBaseParams(threadCount: threadCount,
+                                              language: language, translate: translate)
+        defer { free(langCStr) }
+        // The retained box, samples, params and self live until whisper_full returns,
+        // even when Swift has already resumed the caller with cancellation/timeout.
+        let callbackBox = InferenceCallbackBox(cancellation: cancellation, progress: onProgress)
+        let callbackPtr = Unmanaged.passRetained(callbackBox).toOpaque()
+        defer { Unmanaged<InferenceCallbackBox>.fromOpaque(callbackPtr).release() }
+        params.abort_callback_user_data = callbackPtr
+        params.abort_callback = { userData in
+            guard let userData else { return false }
+            return Unmanaged<InferenceCallbackBox>.fromOpaque(userData)
+                .takeUnretainedValue().cancellation.isCancelled
+        }
+        if onProgress != nil {
+            params.progress_callback_user_data = callbackPtr
+            params.progress_callback = { _, _, progress, userData in
+                guard let userData else { return }
+                let box = Unmanaged<InferenceCallbackBox>.fromOpaque(userData).takeUnretainedValue()
+                guard !box.cancellation.isCancelled else { return }
+                DispatchQueue.main.async {
+                    guard !box.cancellation.isCancelled else { return }
+                    box.progress?(Double(progress) / 100)
                 }
             }
-        case .nemotron(let directory):
-            liveStateLock.withLock { liveNemotronActive = true }
-            try await nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory, isDirectory: true))
         }
+
+        let result = samples.withUnsafeBufferPointer { buf in
+            whisper_full(ctx, params, buf.baseAddress, Int32(buf.count))
+        }
+        try cancellation.checkCancellation()
+        guard result == 0 else {
+            throw TranscriptionError.decoderFailed(result)
+        }
+
+        let detected = detectedLanguage(in: ctx)
+        var segments: [TranscriptionSegment] = []
+        var fullText = ""
+        for i in 0..<whisper_full_n_segments(ctx) {
+            try cancellation.checkCancellation()
+            let t0 = whisper_full_get_segment_t0(ctx, i)
+            let t1 = whisper_full_get_segment_t1(ctx, i)
+            let text = whisper_full_get_segment_text(ctx, i).map {
+                normalizedScript(String(cString: $0), language: detected, translate: translate)
+            } ?? ""
+            segments.append(TranscriptionSegment(start: Double(t0) / 100,
+                                                  end: Double(t1) / 100, text: text))
+            fullText += text
+        }
+        return TranscriptionResult(text: fullText, segments: segments, detectedLanguage: detected)
     }
 
     // MARK: - Params Configuration
+
+    private func validateLanguage(_ language: String?, for ctx: OpaquePointer) throws {
+        guard let language,
+              !language.isEmpty,
+              language != "auto",
+              language != "en",
+              whisper_is_multilingual(ctx) == 0 else { return }
+        throw TranscriptionError.processFailed(
+            "The selected model is English-only. Choose English or select a multilingual model."
+        )
+    }
+
+    private func detectedLanguage(in ctx: OpaquePointer) -> String? {
+        let langId = whisper_full_lang_id(ctx)
+        guard langId >= 0, let langPtr = whisper_lang_str(langId) else { return nil }
+        return String(cString: langPtr)
+    }
+
+    /// Normalize Chinese transcription to Simplified Chinese using ICU's
+    /// built-in script conversion. No character dictionary is maintained here.
+    private func normalizedScript(_ text: String,
+                                  language: String?,
+                                  translate: Bool = false) -> String {
+        guard !translate, language == "zh" else { return text }
+        return text.applyingTransform(StringTransform("Traditional-Simplified"), reverse: false) ?? text
+    }
 
     /// Create base whisper params. `language` nil/empty means auto-detect; when
     /// `translate` is true whisper translates the audio to English.
@@ -291,6 +273,10 @@ final class TranscriptionService: @unchecked Sendable {
         params.print_progress = false
         params.print_realtime = false
         params.print_timestamps = false
+        // Suppress the model's built-in non-speech tokens (music, noise, etc.)
+        // during decoding. This operates on token IDs, so it avoids maintaining
+        // a language-dependent list of strings such as "[Music]".
+        params.suppress_nst = true
         params.n_threads = threadCount ?? max(1, Int32(ProcessInfo.processInfo.activeProcessorCount / 2))
         params.translate = translate
 
@@ -350,7 +336,7 @@ final class TranscriptionService: @unchecked Sendable {
     /// crash a whisper_full running concurrently on the queue if done anywhere else.
     @discardableResult
     private func ensureModelLoaded() throws -> OpaquePointer {
-        dispatchPrecondition(condition: .onQueue(whisperQueue))
+        whisperQueue.assertOnQueue()
         let path = resolveModelPath()
         guard FileManager.default.fileExists(atPath: path) else {
             throw TranscriptionError.modelNotFound(
@@ -375,7 +361,7 @@ final class TranscriptionService: @unchecked Sendable {
     /// resolves to the same file as the main model, the main context is shared
     /// instead of loading the same weights twice. MUST run on `whisperQueue`.
     private func ensureLiveModelLoaded() throws -> OpaquePointer {
-        dispatchPrecondition(condition: .onQueue(whisperQueue))
+        whisperQueue.assertOnQueue()
         let livePath = resolveLiveModelPath()
         if livePath == resolveModelPath() {
             // Drop a stale dedicated context (live selection changed mid-session).
@@ -464,10 +450,12 @@ final class TranscriptionService: @unchecked Sendable {
     }
 }
 
-// Box for passing progress handler through C callback
-private class ProgressBox {
-    let handler: @Sendable (Double) -> Void
-    init(handler: @escaping @Sendable (Double) -> Void) {
-        self.handler = handler
+// Shared callback state is retained until the C operation actually returns.
+private final class InferenceCallbackBox: @unchecked Sendable {
+    let cancellation: TranscriptionCancellation
+    let progress: (@Sendable (Double) -> Void)?
+    init(cancellation: TranscriptionCancellation, progress: (@Sendable (Double) -> Void)?) {
+        self.cancellation = cancellation
+        self.progress = progress
     }
 }

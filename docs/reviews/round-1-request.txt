@@ -1,0 +1,9 @@
+请对当前 whisperASR 工作区进行第 1 轮独立交叉 code review（请求 ID: whisperasr-0.6.2-R1）。这次只审查，不改源码、不 commit/push、不安装/退出应用、不读取用户录音或密钥。允许安全编译和运行 Tests 中独立检查；不要因旧会话授权而修改代码。
+
+路径 /Users/min.zheng/Documents/github/whisperASR。HEAD/base 均为 95edefce6ac790c1beba8652b6dd903991ed8e99；先看 7a1d158 与 95edefc diff，再看当前未提交 diff 和新增 Sources/Tests 文件。待审源已冻结，SHA-256 清单 .build/reviews/round-1-manifest.txt；请先核对。这是 Codex 按上一轮 review 实施的修复，最终待你审查后才会构建 0.6.2 并替换 /Applications/WhisperASR.app。
+
+重点：AppState 的 final PCM drain、30s backlog 推进、空/仅旧 overlap 结果是否漏尾文、sealed 不回滚、翻译 pause/session epoch/3s finish grace、恢复失败保留；AudioRecorder 停止/重启/迟到 callback gate 与原子 PCM；CancellationSupport 的 cancellation/timeout/continuation/context 真实生命周期与 bounded queue；NSTextView 的 disjoint edits、UTF-16 历史选区、Cmd+A pause/Resume、空模型不卸载、只拷原文/翻译/时间戳、revision hints；API busy/timeout 和文件 pending 重试。不要整体换框架，不做未经实测的 VAD/prompt/beam/audio_ctx 调参，默认解码参数未改变。
+
+本地已通过 swift build 与四组检查（各 Tests 文件头有命令）：LiveTranscriptChecks、LiveAudioChecks、TranscriptionCancellationChecks、LiveSessionChecks；最后一组使用真实 AppState + mock 硬件/网络。请独立找遗漏，不只重复测试结论。已知限制：历史 COW/完整 recovery JSON 仍 O(n)；AudioLoader 解码不在原生 executor deadline 内；真实 Metal hang/长会话功耗/CER/WER 未实测；现有 xcframework 内对象部署目标 26.0 的 linker warning，在本机 macOS 26.6.2 可构建，不能据此声称已验证 macOS 14。
+
+请中文按严重度给出可执行发现、文件:行号、复现路径、最小修复和风险，区分确定问题与假设，并明确哪些阻挡本机安装。若没有新的阻挡问题明确说明，不要声称“优化极限”。结束时复核清单未被改变。

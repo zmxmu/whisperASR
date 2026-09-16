@@ -1,0 +1,71 @@
+Claude Desktop Code — 音频转文字性能优化
+会话：claude.ai/epitaxy/local_42521cb2-b52d-4fb4-9098-853ab70cf36e
+模型/effort：Fable 5.1 / Extra；通过 CUA 读取完整最终答复。
+以下为最终答复正文，仅合并界面分段与表格排版。复现数字为桩测试，不是实际会议发生率或真实模型吞吐量。
+
+R2 结论（whisperasr-0.6.2-R2）
+
+R1 五项均已解决，但修复 #2 引入了一个新的确定性阻挡问题：Finish 排空可能无限循环。修掉它之前不建议构建安装。
+
+核对：HEAD 95edefce…，round-2 清单开始与结束均 32/32 匹配。swift build 通过，四组检查通过。我未改任何源文件，复现脚本仅在会话 scratchpad。自 R1 变动的源文件为 AppState、CancellationSupport、LiveTranscriptionAssembler、WhisperASRApp、APIServer 与三个测试文件。
+
+R1 逐项
+
+#1 封口 ULP 丢段 — 已解决
+assembler 全部改为整数采样域并规范化时间戳。R1 复现脚本在新代码上 30473 组全部无丢失（R1 为 3045 组丢失）。
+
+#2 liveNeedsFilePass 过宽、翻译丢失 — 已解决，但引入新问题（见下）
+噪声尾窗 Finish 现为 completed 无提示；单次空解码不再抹草稿也不置位；修复路径保留翻译，同文保留、异文清空并提示。R1 三个脚本均通过。
+
+#3 排队超时/busy 永久停 live — 已解决
+beginExecution 与期限同锁区分 .queuedTimedOut/.timedOut；live 与 preload 对 busy/排队超时等待重试，Finish 时转文件 pending；API 分别 503/504。
+
+#4 保存期间 URL 启动录音 — 已解决
+handleURL 在 saving/finishing 时拒绝并 toast；异步查找返回后二次 guard；Finish 仅在仍为 saving 时置 idle。晚到分支静默返回无 toast，属小瑕疵。
+
+#5 轮询拷贝 PCM — 已解决
+先用 accumulatedSampleCount 门控，再取快照；解码与扫描仍用同一快照。
+
+新问题
+
+1. 确定，阻挡：Finish 排空在“保留草稿 + 解码持续为空 + 积压超过 30 秒”时无限循环
+
+LiveTranscriptionAssembler.swift:67-71 在结果为空且有草稿时提前返回，不推进游标，也不经过 force 逻辑。AppState.swift:557 只把它记为 lastEmptyAvailableEnd，而该门控在 finishRequested 时被跳过（第 480 行），末尾的休眠也被跳过（第 579 行），窗口又不是 final（第 563 行）。于是循环对同一个 30 秒窗口反复推理，没有任何退出条件。
+
+复现（真实 AppState，桩解码器）：13 秒语音得到 12 段封口加 1 段草稿，随后解码器对所有窗口返回空，再进 45 秒 RMS 0.002 的噪声，然后 Finish。
+Finish 前推理次数：2
+Finish 后 3 秒内推理次数：10488
+Finish 是否完成：否，录音器停留在 saving
+
+真实模型下表现为“Saving recording…”永不结束，GPU 连续满载，只有退出应用能中断。触发条件是草稿被解码器不再复现（幻觉段或 no_speech 判定）且用户在停顿 30 到 90 秒之间点 Finish。90 秒后缓冲淘汰会自行解围，30 秒内则走 final 分支正常修复，所以窗口是这 60 秒。
+
+最小修复：在 runLiveLoop 处理 keptDraftAfterEmpty 时增加推进条件。
+
+lastEmptyAvailableEnd = publication.keptDraftAfterEmpty ? snapshot.availableEnd : nil
+if publication.keptDraftAfterEmpty && finishRequested {
+    // Draining: a full window cannot reproduce the draft; never re-decode it forever.
+    liveNeedsFilePass = true
+    publishLive(assembler.skip(to: snapshot.end))
+    recorder.trimSamples(upTo: assembler.tailStart)
+    continue
+}
+
+并给 LiveSessionChecks 加一条“草稿 + 全空解码 + 45 秒积压 + Finish 必须完成并走修复”的用例。风险低，只影响已无法复现草稿的排空路径。
+
+2. 确定，中：直播中同样条件让游标卡住直到 90 秒淘汰
+
+同一分支在录音进行中的表现：草稿保留，游标不动，每 0.75 到 2 秒对最长 30 秒的窗口重新推理一次（非热循环），直到缓冲超过 90 秒触发淘汰，才以“fell behind”置位修复并丢掉草稿。复现：100 秒噪声期间 12 次推理，第 94 秒报 fell behind，草稿从 13 段变 12 段，Finish 后进入整文件修复。
+
+结果不是数据丢失，而是一次本可避免的整文件重转，外加 90 秒内持续的 30 秒窗口推理负载。
+
+建议：连续第二次保留草稿且自首次保留以来新音频已超过 12 秒时，按“无语音”处理，skip 过草稿并置位修复（与淘汰路径一致），或直接封口草稿。这样不影响 transientEmptyPreservesDraftAndRecovers 覆盖的单次空结果。
+
+其他说明
+
+- 排队超时重试期间若文件任务占用 GPU 超过约 90 秒，缓冲淘汰仍会导致修复，属既定内存上限行为，不算回退。
+- autoStartRecording 晚到 guard 静默返回，可补 toast，不阻挡。
+- 未实测项与 R1 相同：macOS 14 兼容、长会议功耗与识别率、Escape 真实键路径。
+
+安装判断
+
+新问题 1 阻挡本机安装。问题 2 建议同批修，改动集中在同一处。其余无阻挡。

@@ -2,6 +2,56 @@ import Foundation
 import Observation
 import SwiftUI
 
+// MARK: - Recognition Language Mode
+
+enum RecognitionLanguageMode: String, CaseIterable {
+    static let defaultsKey = "recognitionLanguageMode"
+
+    case automatic
+    case mandarin
+    case english
+    case mandarinEnglish
+
+    var label: String {
+        switch self {
+        case .automatic: return "自动检测"
+        case .mandarin: return "普通话"
+        case .english: return "English"
+        case .mandarinEnglish: return "中英混合"
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .automatic:
+            return "Automatically detect any language supported by the selected model."
+        case .mandarin:
+            return "Treat the audio as Mandarin and output Simplified Chinese."
+        case .english:
+            return "Treat the audio as English."
+        case .mandarinEnglish:
+            return "Treat Mandarin as the primary language while preserving spoken English words."
+        }
+    }
+
+    /// Whisper accepts one primary language token per decode window. A
+    /// multilingual model can still emit English tokens while conditioned on
+    /// Chinese, which is the most reliable setup for Mandarin-English speech
+    /// without reopening auto-detection to every supported language.
+    var whisperLanguage: String? {
+        switch self {
+        case .automatic: return nil
+        case .english: return "en"
+        case .mandarin, .mandarinEnglish: return "zh"
+        }
+    }
+
+    static var current: RecognitionLanguageMode {
+        let raw = UserDefaults.standard.string(forKey: defaultsKey)
+        return raw.flatMap(RecognitionLanguageMode.init(rawValue:)) ?? .mandarinEnglish
+    }
+}
+
 // MARK: - Transcript Font Size
 
 enum TranscriptFontSize: String, CaseIterable {
@@ -89,11 +139,13 @@ enum TranscriptionStatus: Equatable {
 // MARK: - Errors
 
 enum TranscriptionError: LocalizedError {
+    case decoderFailed(Int32)
     case processFailed(String)
     case modelNotFound(String)
 
     var errorDescription: String? {
         switch self {
+        case .decoderFailed(let code): return "Transcription failed: whisper_full returned error \(code)"
         case .processFailed(let msg): return "Transcription failed: \(msg)"
         case .modelNotFound(let msg): return msg
         }

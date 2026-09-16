@@ -65,6 +65,7 @@ struct WhisperASRApp: App {
     }
 }
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     var appState: AppState?
     var audioRecorder: AudioRecorder?
@@ -96,6 +97,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func handleURL(_ url: URL) {
         guard url.scheme == "whisperasr", url.host == "record",
               let openWindow, let audioRecorder else { return }
+        guard appState?.isFinishingRecording != true, audioRecorder.state != .saving else {
+            appState?.showToast("The current recording is still being saved. Try the recording link again after it finishes.")
+            return
+        }
 
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let queryItems = components?.queryItems ?? []
@@ -177,6 +182,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 await MainActor.run {
+                    guard self.appState?.isFinishingRecording != true,
+                          audioRecorder.state != .saving,
+                          audioRecorder.state != .recording else { return }
                     audioRecorder.state = .ready
                     audioRecorder.startRecording(app: matchedApp)
                     openWindow(id: "recording")

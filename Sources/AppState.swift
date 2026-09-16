@@ -1,13 +1,28 @@
 import Foundation
 import Observation
+import os
 
+@MainActor
 @Observable
 class AppState {
     var items: [TranscriptionItem] = []
     var selectedItemID: UUID?
 
     // Live transcription state
-    var liveSegments: [TranscriptionSegment] = []
+    var liveSegments: [TranscriptionSegment] = [] {
+        didSet { advanceLiveTextRevision() }
+    }
+    private(set) var liveTextRevision: UInt64 = 0
+    private(set) var liveTextSourceRevision: UInt64?
+    private(set) var liveTextDirtyFrom: Int?
+    @ObservationIgnored private var nextTextDirtyFrom: Int?
+
+    private func advanceLiveTextRevision() {
+        liveTextSourceRevision = liveTextRevision
+        liveTextDirtyFrom = nextTextDirtyFrom
+        nextTextDirtyFrom = nil
+        liveTextRevision &+= 1
+    }
     var isLiveTranscribing = false
     var enableLiveTranscription = true
 
@@ -24,7 +39,9 @@ class AppState {
     private var lastToastText: String?
 
     // Live translation state (per-segment)
-    var liveTranslatedSegments: [String] = []
+    var liveTranslatedSegments: [String] = [] {
+        didSet { advanceLiveTextRevision() }
+    }
     var enableLiveTranslation = false
     /// User-controlled pause for live translation (e.g. the speaker switched to
     /// the listener's native language). Distinct from `translationAuthPaused`,
@@ -32,26 +49,34 @@ class AppState {
     /// resume, segments spoken during the pause are skipped so only new speech
     /// is translated.
     var liveTranslationPaused = false
-    private var liveTranslatedSourceTexts: [String] = []  // tracks what text each translation was for
-    /// Parallel to liveTranslatedSegments: number of consecutive chunks a segment's
-    /// source text has been stable. Sealed (>= sealThreshold) segments are never retranslated.
-    private var liveTranslatedSealCount: [Int] = []
-    private static let sealThreshold = 3
+    private var liveTranslatedSourceTexts: [String] = []
+    private var liveSealedSegmentCount = 0
+    private var translationNextIndex = 0
+    private var translationEpoch: UInt64 = 0
+    private var translationResumeTime = 0.0
+    private var liveTranslationLanguage: String?
+    private var lastInterimTranslation = Date.distantPast
+    private var lastInterimTexts: [String] = []
+    private var lastInterimStart = -1
 
     private let service = TranscriptionService()
     private var isTranscribing = false
+    private var fileTranscriptionTask: Task<Void, Never>?
     private var liveTranscriptionTask: Task<Void, Never>?
     private var liveTranslationTask: Task<Void, Never>?
-    /// Single-slot queue: each snapshot supersedes the previous one (they are cumulative),
-    /// so keeping a queue of old snapshots was pure wasted work. `countsSeals` is
-    /// true for seal-anchored snapshots — only those advance the translation seal
-    /// counts, so the faster interim passes can't prematurely lock a segment.
-    private var pendingTranslationSnapshot: (segments: [TranscriptionSegment], countsSeals: Bool)?
-    private var isTranslationWorkerRunning = false
+    private var liveSessionID: UUID?
+    private weak var liveRecorder: AudioRecorder?
+    private var finishRequested = false
+    private var liveNeedsFilePass = false
+    private var liveUsedDifferentModel = false
+    private(set) var isFinishingRecording = false
     private var translationFailureCount = 0
-    /// Set when translation is paused due to an auth error; cleared on next start.
     private var translationAuthPaused = false
     private var lastAutoSaveTime: Date = .distantPast
+    private var lastRecoveryRevision: UInt64?
+    @ObservationIgnored private let recoveryURL: URL
+    @ObservationIgnored private let recoverySaveRunning = OSAllocatedUnfairLock(initialState: false)
+    nonisolated private static let recoveryQueue = DispatchQueue(label: "WhisperASR.recovery", qos: .utility)
 
     /// Maximum chunk duration sent to whisper (30 seconds at 16kHz).
     /// Caps processing time so the loop never snowballs.
@@ -66,8 +91,9 @@ class AppState {
     /// the effective translation cadence; whisper's slower passes self-limit.
     private static let interimTranslationInterval: TimeInterval = 2.0
 
-    init() {
-        items = TranscriptionStore.loadAll()
+    init(restoreStoredItems: Bool = true, recoveryURL: URL? = nil) {
+        self.recoveryURL = recoveryURL ?? Self.liveRecoveryURL
+        items = restoreStoredItems ? TranscriptionStore.loadAll() : []
         selectedItemID = items.first?.id
         // Auto-resume any pending items restored from disk
         if items.contains(where: { $0.status == .pending }) {
@@ -159,40 +185,74 @@ class AppState {
     /// If the audio file failed to save but live transcription produced a
     /// transcript, the transcript is kept as an audio-less item instead of
     /// being silently dropped with the recording.
-    @MainActor
     func finishRecording(recorder: AudioRecorder) async {
-        let segments = liveSegments
-        let fullText = segments.map { $0.text }.joined()
-        let translations = liveTranslatedSegments
-        let lang: String? = !translations.isEmpty
-            ? UserDefaults.standard.string(forKey: "targetLanguage") : nil
-        let hadLiveResults = isLiveTranscribing && !segments.isEmpty
+        guard !isFinishingRecording else { return }
+        isFinishingRecording = true
+        defer { isFinishingRecording = false }
 
-        stopLiveTranscription()
-        let url = await recorder.stopRecording()
+        // Stop producers and drain their serial callback queue before taking the final PCM view.
+        // The live worker remains alive while AVAssetWriter finishes.
+        let url = await recorder.stopRecording(preservePCM: true)
+        finishRequested = true
+        await liveTranscriptionTask?.value
 
-        if let url {
-            // Live results from a dedicated (usually smaller/faster) live model
-            // are a draft: send the saved recording through the normal pipeline
-            // so the main model produces the final transcript. Only when live
-            // ran on the same model are its results kept as final.
-            let liveModelDiffers = !ModelManager.shared.liveFileName.isEmpty
-                && ModelManager.shared.liveFileName != ModelManager.shared.selectedFileName
-            if hadLiveResults && !liveModelDiffers {
-                addFileWithLiveResults(url: url, segments: segments, fullText: fullText,
-                                       translatedSegments: translations, translationLanguage: lang)
-            } else {
-                addFile(url: url)
+        // Give the final sealed batch a short opportunity to finish, but never make
+        // saving audio depend indefinitely on network/auth availability.
+        if enableLiveTranslation && !liveTranslationPaused && !translationAuthPaused,
+           translationNextIndex < liveSealedSegmentCount {
+            enqueueLiveTranslation()
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            while !Task.isCancelled, liveTranslationTask != nil, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(100))
             }
-        } else if hadLiveResults {
+        }
+        if enableLiveTranslation && !liveTranslationPaused && translationNextIndex < liveSealedSegmentCount {
+            showToast("Recording saved with partial translation. Use Translate on the saved item to finish it.")
+        }
+
+        let segments = liveSegments
+        let fullText = segments.map(\.text).joined()
+        let translations = liveTranslatedSegments
+        let lang = translations.contains(where: { !$0.isEmpty }) ? liveTranslationLanguage : nil
+        var saved = false
+        if let url {
+            if !segments.isEmpty && !liveNeedsFilePass && !liveUsedDifferentModel {
+                let item = addFileWithLiveResults(url: url, segments: segments, fullText: fullText,
+                    translatedSegments: translations, translationLanguage: lang)
+                saved = TranscriptionStore.save(item)
+            } else {
+                // Evicted PCM / timed-out inference cannot be called a completed transcript.
+                // Keep provisional text visible while a full-file pass repairs the missing audio.
+                let item = TranscriptionItem(fileURL: url)
+                item.segments = segments
+                item.fullText = fullText
+                item.translatedSegments = translations
+                item.translationLanguage = lang
+                items.insert(item, at: 0)
+                selectedItemID = item.id
+                saved = TranscriptionStore.save(item)
+                enqueueTranscription(for: item)
+                if liveNeedsFilePass {
+                    showToast("Live transcription was incomplete. The saved audio is queued for a full transcription.")
+                }
+            }
+        } else if !segments.isEmpty {
             let item = addFileWithLiveResults(
                 url: URL(fileURLWithPath: "/unsaved-recording-\(UUID().uuidString)"),
                 segments: segments, fullText: fullText,
                 translatedSegments: translations, translationLanguage: lang)
             item.fileName = "Recording \(DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .short)) (audio not saved)"
-            TranscriptionStore.save(item)
+            if liveNeedsFilePass { item.status = .failed("Audio could not be saved; recovered live text may be incomplete.") }
+            saved = TranscriptionStore.save(item)
         }
-        recorder.state = .idle
+        // Never erase recovery data after a failed durable save.
+        if !saved && !segments.isEmpty {
+            autoSaveLiveTranscription()
+            showToast("Couldn't save the transcript item. Live recovery data has been retained.")
+        }
+        resetLiveSession(removeRecovery: saved)
+        recorder.clearTranscriptionBuffer()
+        if recorder.state == .saving { recorder.state = .idle }
     }
 
     // MARK: - Translate Completed Transcription
@@ -286,6 +346,7 @@ class AppState {
     /// item cancels its pass instead of letting it label a transcript that no
     /// longer wants it.
     private var diarizationTasks: [UUID: Task<Void, Never>] = [:]
+    private var diarizationEpochs: [UUID: UUID] = [:]
 
     /// Runs diarization over a finished transcript and labels its segments with
     /// who spoke. Known voices are enrolled first so recognized speakers come back
@@ -304,12 +365,17 @@ class AppState {
 
         let knownSpeakers = SpeakerLibrary.knownSpeakerSamples(for: knownSpeakerIDs)
         let provider = DiarizationService.provider()
+        let epoch = UUID()
+        diarizationEpochs[item.id] = epoch
 
         diarizationTasks[item.id] = Task { @MainActor in
             defer {
-                item.isDiarizing = false
-                item.diarizationProgress = 0
-                diarizationTasks[item.id] = nil
+                if diarizationEpochs[item.id] == epoch {
+                    item.isDiarizing = false
+                    item.diarizationProgress = 0
+                    diarizationTasks[item.id] = nil
+                    diarizationEpochs[item.id] = nil
+                }
             }
             do {
                 let result = try await provider.diarize(
@@ -317,11 +383,14 @@ class AppState {
                     knownSpeakers: knownSpeakers
                 ) { progress in
                     Task { @MainActor in
+                        guard self.diarizationEpochs[item.id] == epoch else { return }
                         item.diarizationProgress = progress
                     }
                 }
                 // Extraction is the slow part of enrollment; cache what this pass
                 // computed so the next one reuses it.
+                try Task.checkCancellation()
+                guard diarizationEpochs[item.id] == epoch else { return }
                 SpeakerLibrary.cacheEmbeddings(result.extractedEmbeddings)
                 item.segments = DiarizationService.assignSpeakers(to: item.segments,
                                                                   turns: result.turns)
@@ -329,6 +398,7 @@ class AppState {
             } catch is CancellationError {
                 // The item was removed or re-transcribed — nothing to report.
             } catch {
+                guard !Task.isCancelled, diarizationEpochs[item.id] == epoch else { return }
                 print("[Diarization] \(provider.displayName) failed: \(error)")
                 item.diarizationError = error.localizedDescription
                 self.showToast("Couldn't identify speakers: \(error.localizedDescription)")
@@ -339,9 +409,17 @@ class AppState {
     private func cancelDiarization(for item: TranscriptionItem) {
         diarizationTasks[item.id]?.cancel()
         diarizationTasks[item.id] = nil
+        diarizationEpochs[item.id] = nil
+        item.isDiarizing = false
+        item.diarizationProgress = 0
     }
 
     func shutdown() {
+        for task in diarizationTasks.values { task.cancel() }
+        diarizationEpochs.removeAll()
+        fileTranscriptionTask?.cancel()
+        liveTranscriptionTask?.cancel()
+        invalidateTranslationWorker()
         service.shutdown()
     }
 
@@ -370,289 +448,376 @@ class AppState {
         item.status = .transcribing
         item.progress = 0
         item.transcriptionStartTime = Date()
+        let recognitionLanguage = RecognitionLanguageMode.current.whisperLanguage
 
-        Task.detached { [service] in
-            do {
-                let result = try await service.transcribe(fileURL: item.fileURL) { progress in
-                    Task { @MainActor in
-                        item.progress = progress
+        fileTranscriptionTask = Task { [weak self, service] in
+            guard let self else { return }
+            while !Task.isCancelled, items.contains(where: { $0.id == item.id }) {
+                do {
+                    let result = try await service.transcribe(
+                        fileURL: item.fileURL, language: recognitionLanguage
+                    ) { progress in
+                        Task { @MainActor in
+                            item.status = .transcribing
+                            item.progress = progress
+                        }
                     }
-                }
-                await MainActor.run {
+                    guard !Task.isCancelled, items.contains(where: { $0.id == item.id }) else { break }
+                    if !item.translatedSegments.isEmpty {
+                        let sameSources = item.segments.count == result.segments.count &&
+                            zip(item.segments, result.segments).allSatisfy { $0.text == $1.text }
+                        if !sameSources {
+                            item.translatedSegments = []
+                            item.translationLanguage = nil
+                            showToast("The full transcription changed the source segments. Use Translate on the saved item to update its translation.")
+                        }
+                    }
                     item.segments = result.segments
                     item.fullText = result.text
                     item.status = .completed
                     TranscriptionStore.save(item)
-                }
-            } catch {
-                await MainActor.run {
+                    break
+                } catch let error as TranscriptionExecutionError where Self.isWaitingForService(error) {
+                    guard !Task.isCancelled, items.contains(where: { $0.id == item.id }) else { break }
+                    // A native timeout may still own the GPU. Preserve queued work;
+                    // do not cascade a temporary busy error through every pending file.
+                    if item.status != .pending {
+                        item.status = .pending
+                        TranscriptionStore.save(item)
+                    }
+                    try? await Task.sleep(for: .seconds(2))
+                } catch {
+                    guard !Task.isCancelled, items.contains(where: { $0.id == item.id }) else { break }
                     item.status = .failed(error.localizedDescription)
                     TranscriptionStore.save(item)
+                    break
                 }
             }
-            await MainActor.run { [weak self] in
-                self?.startNextTranscription()
-            }
+            if !Task.isCancelled { startNextTranscription() }
         }
     }
 
     // MARK: - Live Transcription During Recording
 
-    /// Start periodic live transcription from the AudioRecorder's accumulated PCM buffer.
+    /// All publication and lifecycle state is main-actor isolated. Only bounded PCM windows
+    /// cross into the serialized native executor; an old session can never publish into a new one.
     func startLiveTranscription(recorder: AudioRecorder) {
+        guard liveSessionID == nil, !isFinishingRecording else { return }
+        let session = UUID()
+        liveSessionID = session
+        liveRecorder = recorder
+        finishRequested = false
+        liveNeedsFilePass = false
+        liveUsedDifferentModel = service.liveModelDiffers
         liveSegments = []
+        liveTranslatedSegments = []
+        liveTranslatedSourceTexts = []
+        liveSealedSegmentCount = 0
+        translationNextIndex = 0
+        translationResumeTime = 0
+        liveTranslationLanguage = nil
+        lastInterimTranslation = .distantPast
+        lastInterimTexts = []
+        lastInterimStart = -1
         liveError = nil
         liveTranslationError = nil
-        liveTranslatedSealCount = []
         translationFailureCount = 0
         translationAuthPaused = false
         liveTranslationPaused = false
+        lastAutoSaveTime = .distantPast
+        lastRecoveryRevision = nil
         isLiveTranscribing = true
+        let language = RecognitionLanguageMode.current.whisperLanguage
 
         liveTranscriptionTask = Task { [weak self] in
             guard let self else { return }
-
-            // Pre-load the model and wait for it — avoids model loading latency on first chunk.
-            // Surface load failures so the user isn't stuck at a silent "Waiting for audio...".
-            do {
-                try await self.service.preloadLiveModel()
-            } catch {
-                await MainActor.run {
-                    self.liveError = "Couldn't load transcription model: \(error.localizedDescription)"
-                    self.isLiveTranscribing = false
-                }
-                return
+            defer {
+                if session == liveSessionID { isLiveTranscribing = false }
             }
-            guard !Task.isCancelled else { return }
-
-            // Partial/final streaming model:
-            //  - Every pass re-transcribes the unsealed *tail* and shows it immediately, so the
-            //    in-progress sentence appears within ~1s (no waiting for a pause).
-            //  - Segments before the last silence pause are *sealed* (final) — they stop changing
-            //    and are never re-transcribed, which keeps boundaries clean and translation steady.
-            var sealedSegments: [TranscriptionSegment] = []
-            var sealedSampleCount = 0
-            // Whether the seal boundary fell inside a pause (clean). A clean boundary needs no
-            // left-context overlap; a forced mid-speech seal does, to avoid clipping the cut word.
-            var sealedClean = true
-            var consecutiveSilenceCount = 0
-            var lastTranscribedTotal = 0
-            // Interim-translation debounce (see interimTranslationInterval).
-            var lastInterimTranslation = Date.distantPast
-            var lastTranslatedSnapshotText = ""
-
-            // Silence-scan tuning (16kHz): 100ms frames; a run of >=3 (~300ms) counts as a pause.
-            let frameSamples = 1600
-            let minSilenceFrames = 3
-            let silenceThreshold: Float = 0.001
-            let contextSamples = 16000   // 1s left-context, used only after a forced seal
-
-            // The loop awaits each transcribeChunk before iterating, so passes never overlap.
-            while !Task.isCancelled {
-                let totalSamples = recorder.accumulatedSampleCount
-                let tailCount = totalSamples - sealedSampleCount
-
-                // Need >=0.5s of unsealed audio and >=0.3s of new audio since the last pass —
-                // keeps the live tail fresh without re-transcribing identical audio in a tight loop.
-                guard tailCount >= 8000, totalSamples - lastTranscribedTotal >= 4800 else {
-                    try? await Task.sleep(for: .milliseconds(250))
-                    continue
+            do {
+                var waitingSince: ContinuousClock.Instant?
+                while !Task.isCancelled, session == liveSessionID {
+                    do {
+                        try await service.preloadModel()
+                        break
+                    } catch let error as TranscriptionExecutionError where Self.isWaitingForService(error) {
+                        if finishRequested { liveNeedsFilePass = true; return }
+                        let began = waitingSince ?? .now
+                        waitingSince = began
+                        if began.duration(to: .now) >= .seconds(30) { throw error }
+                        liveError = "【请稍候，无需重新抓取】识别服务忙，正在自动重试；录音继续。"
+                        try await Task.sleep(for: .seconds(1))
+                    }
                 }
-
-                // If the whole unsealed tail is silence, seal forward and show only sealed text.
-                let rms = recorder.rmsEnergy(from: sealedSampleCount, count: tailCount)
-                guard rms > silenceThreshold else {
-                    sealedSampleCount = totalSamples
-                    sealedClean = true
-                    lastTranscribedTotal = totalSamples
-                    recorder.trimSamples(upTo: max(0, sealedSampleCount - contextSamples))
-                    consecutiveSilenceCount += 1
-                    let snapshot = sealedSegments
-                    await MainActor.run {
-                        self.liveSegments = snapshot
-                        self.throttledAutoSave()
-                    }
-                    try? await Task.sleep(for: .milliseconds(consecutiveSilenceCount >= 2 ? 1000 : 500))
-                    continue
-                }
-                consecutiveSilenceCount = 0
-
-                // Re-transcribe the unsealed tail for live display. After a clean (silence) seal the
-                // boundary needs no overlap; after a forced seal, re-transcribe 1s of context and
-                // dedup so the cut word isn't dropped.
-                let useOverlap = !sealedClean
-                var tailStart = useOverlap ? max(0, sealedSampleCount - contextSamples) : sealedSampleCount
-
-                // Defensive: bound the tail to whisper's 30s window. Only reachable if a pass
-                // stalled badly; surface it instead of silently mis-transcribing.
-                if totalSamples - tailStart > Self.maxChunkSamples {
-                    print("[AppState] live tail \(totalSamples - tailStart) samples exceeds maxChunkSamples — transcribing only the most recent (older audio skipped)")
-                    await MainActor.run {
-                        self.liveError = "Transcription is falling behind — some audio may be skipped."
-                    }
-                    tailStart = totalSamples - Self.maxChunkSamples
-                }
-
-                let chunk = recorder.getSamples(from: tailStart, upTo: totalSamples)
-                guard !chunk.isEmpty else {
-                    try? await Task.sleep(for: .milliseconds(250))
-                    continue
-                }
-                lastTranscribedTotal = totalSamples
-                let timeOffset = Double(tailStart) / 16000.0
-
-                // Cap the wait so a GPU/Metal hang doesn't deadlock the live loop.
-                // Generous: 4× chunk duration, minimum 60s.
-                let chunkSeconds = Double(chunk.count) / 16000.0
-                let timeoutSeconds = max(60.0, chunkSeconds * 4.0)
-                do {
-                    let result = try await Self.withTimeout(seconds: timeoutSeconds) {
-                        try await self.service.transcribeChunk(samples: chunk)
-                    }
-
-                    // Offset timestamps to match position in the full stream.
-                    let tailSegments = result.segments.map { seg in
-                        TranscriptionSegment(
-                            start: seg.start + timeOffset,
-                            end: seg.end.map { $0 + timeOffset },
-                            text: seg.text
-                        )
-                    }
-
-                    // Combine sealed (final) + freshly transcribed tail (interim) for display.
-                    let tailStartTime = Double(tailStart) / 16000.0
-                    let kept = sealedSegments.filter { $0.start < tailStartTime }
-                    var combined = kept
-                    for seg in tailSegments {
-                        var text = seg.text
-                        if useOverlap, let lastText = combined.last?.text {
-                            text = Self.trimOverlap(previous: lastText, current: text)
-                        }
-                        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            combined.append(TranscriptionSegment(
-                                start: seg.start, end: seg.end, text: text))
-                        }
-                    }
-
-                    // Advance the seal: to a trailing pause (clean), or forced once the tail has
-                    // grown past the cap without one. Everything before it becomes final.
-                    let silenceCut = recorder.lastSilenceCut(
-                        searchFrom: sealedSampleCount, searchTo: totalSamples,
-                        frameSamples: frameSamples, silenceThreshold: silenceThreshold,
-                        minSilenceFrames: minSilenceFrames)
-                    var newSeal = sealedSampleCount
-                    var newSealClean = sealedClean
-                    if let cut = silenceCut, cut - sealedSampleCount >= 8000 {
-                        newSeal = cut; newSealClean = true
-                    } else if tailCount >= Self.forceChunkSamples {
-                        newSeal = totalSamples; newSealClean = false
-                    }
-
-                    var sealAdvanced = false
-                    if newSeal > sealedSampleCount {
-                        let sealTime = Double(newSeal) / 16000.0
-                        sealedSegments = combined.filter { $0.start < sealTime }
-                        sealedSampleCount = newSeal
-                        sealedClean = newSealClean
-                        sealAdvanced = true
-                        // Nothing behind a clean (silence) seal is needed again; keep 1s behind a
-                        // forced seal for the next pass's overlap.
-                        recorder.trimSamples(upTo: max(0, newSeal - (newSealClean ? 0 : contextSamples)))
-                    }
-
-                    let snapshot = combined
-                    await MainActor.run {
-                        self.liveSegments = snapshot
-                        self.throttledAutoSave()
-                    }
-                    // Seal-anchored passes always translate. Between seals, also translate the
-                    // in-progress tail on a debounce so translations keep up with fast streaming
-                    // engines — the worker is single-flight/latest-wins and the dirty-scan skips
-                    // unchanged text, so this stays cheap and flicker is bounded to the tail.
-                    if self.enableLiveTranslation && !snapshot.isEmpty {
-                        let targetLang = UserDefaults.standard.string(forKey: "targetLanguage") ?? ""
-                        let snapshotText = snapshot.map(\.text).joined(separator: "\n")
-                        let interimDue = Date().timeIntervalSince(lastInterimTranslation) >= Self.interimTranslationInterval
-                            && snapshotText != lastTranslatedSnapshotText
-                        if !targetLang.isEmpty && (sealAdvanced || interimDue) {
-                            lastInterimTranslation = Date()
-                            lastTranslatedSnapshotText = snapshotText
-                            await MainActor.run {
-                                self.enqueueLiveTranslation(snapshot, countsSeals: sealAdvanced)
-                            }
-                        }
-                    }
-                } catch is TimeoutError {
-                    print("[AppState] live transcription chunk timed out after \(timeoutSeconds)s")
-                    await MainActor.run {
-                        self.liveError = "Transcription is slow — the model or GPU may be stuck. Continuing with next chunk."
-                    }
-                } catch {
-                    print("[AppState] live transcription chunk error: \(error)")
-                }
-
-                try? await Task.sleep(for: .milliseconds(250))
+                guard session == liveSessionID, !Task.isCancelled else { return }
+                liveError = nil
+                await runLiveLoop(recorder: recorder, language: language, session: session)
+            } catch {
+                guard session == liveSessionID, !Task.isCancelled else { return }
+                liveNeedsFilePass = true
+                liveError = Self.liveFailureMessage(error)
             }
         }
     }
 
-    /// Stop the live transcription timer. Called when recording ends.
+    private func runLiveLoop(recorder: AudioRecorder, language: String?, session: UUID) async {
+        var assembler = LiveTranscriptionAssembler()
+        var lastTranscribedEnd = 0
+        var lastEmptyAvailableEnd: Int?
+        var firstEmptyAvailableEnd: Int?
+        var inferenceDuration = 0.0
+        var inferenceFailures = 0
+        var waitingSince: ContinuousClock.Instant?
+        defer {
+            // A terminal repair transition stops the periodic loop. Persist its last
+            // draft now even if the normal 15-second checkpoint is not due yet.
+            if liveSessionID == session, !Task.isCancelled, liveNeedsFilePass,
+               !liveSegments.isEmpty {
+                autoSaveLiveTranscription()
+            }
+        }
+
+        while !Task.isCancelled, liveSessionID == session {
+            // Flush a last revision even when subsequent audio is silent or capture is idle.
+            throttledAutoSave()
+            let minimumNewSamples = Int(min(2, max(0.75, inferenceDuration * 0.5)) * 16000)
+            // Cheap admission only: the actual window still comes from one atomic snapshot.
+            // Avoid copying up to 1.9 MB on every 200 ms tick while waiting for more audio.
+            let capturedEnd = recorder.accumulatedSampleCount
+            if !finishRequested {
+                let waitingAfterEmpty = lastEmptyAvailableEnd.map {
+                    capturedEnd - $0 < minimumNewSamples
+                } ?? false
+                let fullWindow = capturedEnd - assembler.tailStart >= Self.maxChunkSamples
+                if waitingAfterEmpty || capturedEnd - assembler.sealedSampleCount < 8000 ||
+                    (!fullWindow && capturedEnd - lastTranscribedEnd < minimumNewSamples) {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    continue
+                }
+            }
+            let snapshot = recorder.transcriptionSnapshot(
+                from: assembler.tailStart, maximumCount: Self.maxChunkSamples)
+            if snapshot.wasEvicted && assembler.sealedSampleCount < snapshot.oldest {
+                liveNeedsFilePass = true
+                liveError = "【结束录音后等待补转；下次可选择更小模型】识别跟不上音频，部分内容将尝试从保存的录音补转。"
+                if firstEmptyAvailableEnd != nil, !assembler.displayedTail.isEmpty {
+                    // Capture may outrun the retry budget while inference is suspended.
+                    // Do not erase the retained draft when its PCM is no longer present.
+                    break
+                }
+                publishLive(assembler.skip(to: snapshot.start))
+            }
+            let finalWindow = finishRequested && snapshot.end == snapshot.availableEnd
+            if finishRequested && snapshot.availableEnd <= assembler.sealedSampleCount { break }
+            if snapshot.samples.isEmpty ||
+                (!finishRequested && snapshot.samples.count < Self.maxChunkSamples &&
+                    (snapshot.end - assembler.sealedSampleCount < 8000 ||
+                    snapshot.end - lastTranscribedEnd < minimumNewSamples)) {
+                try? await Task.sleep(for: .milliseconds(200))
+                continue
+            }
+
+            // Scan exactly the same immutable window that is decoded, never a second buffer read.
+            // Do not throw away an already displayed tail on a low-energy revision.
+            if snapshot.rms <= 0.001 && assembler.displayedTail.isEmpty {
+                publishLive(assembler.skip(to: snapshot.end))
+                lastTranscribedEnd = snapshot.end
+                recorder.trimSamples(upTo: assembler.tailStart)
+                if finalWindow { break }
+                try? await Task.sleep(for: .milliseconds(500))
+                continue
+            }
+
+            let inferenceStart = ContinuousClock.now
+            do {
+                // Whisper requires a meaningful input window even for a sub-second final tail.
+                // Padding is not allowed to extend published timestamps beyond captured audio.
+                var samples = snapshot.samples
+                if samples.count < 16000 { samples += Array(repeating: 0, count: 16000 - samples.count) }
+                liveUsedDifferentModel = liveUsedDifferentModel || service.liveModelDiffers
+                let result = try await service.transcribeChunk(samples: samples, language: language)
+                guard !Task.isCancelled, liveSessionID == session else { return }
+                inferenceFailures = 0
+                waitingSince = nil
+                if finalWindow && result.segments.isEmpty && !assembler.displayedTail.isEmpty {
+                    // A voiced final window without decoder output is not proof of silence.
+                    // Preserve the displayed draft and repair from the durable audio file.
+                    liveNeedsFilePass = true
+                    break
+                }
+                let elapsed = inferenceStart.duration(to: .now).components
+                inferenceDuration = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+                lastTranscribedEnd = snapshot.end
+                let offset = Double(snapshot.start) / 16000
+                let end = Double(snapshot.end) / 16000
+                let segments = result.segments.compactMap { segment -> TranscriptionSegment? in
+                    let start = max(offset, min(end, segment.start + offset))
+                    guard start < end else { return nil }
+                    return TranscriptionSegment(start: start,
+                        end: max(start, min(end, (segment.end ?? Double(samples.count) / 16000) + offset)),
+                        text: segment.text)
+                }
+                let hadDisplayedTail = !assembler.displayedTail.isEmpty
+                let publication = assembler.apply(
+                    result: segments, audioStart: snapshot.start, audioEnd: snapshot.end,
+                    silenceCut: snapshot.lastSilenceCut(searchFrom: assembler.sealedSampleCount),
+                    force: snapshot.end - assembler.sealedSampleCount >= Self.forceChunkSamples,
+                    final: finalWindow)
+                if finalWindow && publication.segments.isEmpty && hadDisplayedTail {
+                    // Output may contain only look-behind segments and become empty after
+                    // reconciliation. Keep the last visible draft at Finish in that case.
+                    liveNeedsFilePass = true
+                    break
+                }
+                if publication.keptDraftAfterEmpty {
+                    // A retained draft makes no cursor progress. While recording, allow a
+                    // transient empty revision to recover, but only for 12 more captured
+                    // seconds. During Finish there is no future audio to wait for at all.
+                    // Exit to durable-file repair instead of dropping/promoting uncertain
+                    // text or repeatedly decoding the same backlogged 30-second window.
+                    let retryBudgetExhausted = firstEmptyAvailableEnd.map {
+                        snapshot.availableEnd - $0 >= Self.forceChunkSamples
+                    } ?? false
+                    if finishRequested || retryBudgetExhausted {
+                        liveNeedsFilePass = true
+                        liveError = "【请结束录音保存，再重新抓取音频】多次识别仍无法确认临时文字，实时识别已停止；录音继续，结束后将尝试补转。"
+                        break
+                    }
+                    firstEmptyAvailableEnd = firstEmptyAvailableEnd ?? snapshot.availableEnd
+                    lastEmptyAvailableEnd = snapshot.availableEnd
+                } else {
+                    firstEmptyAvailableEnd = nil
+                    lastEmptyAvailableEnd = nil
+                }
+                publishLive(publication)
+                liveError = liveNeedsFilePass
+                    ? "【结束录音后等待补转；下次可选择更小模型】实时识别已继续，但此前缺失的内容仍需尝试从保存的录音补转。"
+                    : nil
+                recorder.trimSamples(upTo: assembler.tailStart)
+                throttledAutoSave()
+                enqueueLiveTranslation()
+                if finalWindow { break }
+            } catch let error as TranscriptionExecutionError where Self.isWaitingForService(error) {
+                guard !Task.isCancelled, liveSessionID == session else { return }
+                if finishRequested { liveNeedsFilePass = true; break }
+                let began = waitingSince ?? .now
+                waitingSince = began
+                if began.duration(to: .now) >= .seconds(30) {
+                    liveNeedsFilePass = true
+                    liveError = Self.liveFailureMessage(error)
+                    break
+                }
+                liveError = "【请稍候，无需重新抓取】识别服务忙，正在自动重试；录音继续。"
+                try? await Task.sleep(for: .seconds(1))
+                continue
+            } catch {
+                guard !Task.isCancelled, liveSessionID == session else { return }
+                // A decoder return code means the native call has actually returned.
+                // Retry the uncommitted audio twice; never retry a still-running timed-out C call.
+                if case TranscriptionError.decoderFailed = error, inferenceFailures < 2 {
+                    inferenceFailures += 1
+                    liveError = "【请稍候，无需重新抓取】识别暂时失败，正在自动重试（\(inferenceFailures)/2）；录音继续。"
+                    try? await Task.sleep(for: .seconds(Double(inferenceFailures)))
+                    continue
+                }
+                liveNeedsFilePass = true
+                liveError = Self.liveFailureMessage(error)
+                // A timed-out native call may still own the GPU. Do not queue retries or
+                // pretend that missing PCM is silence. Final filing takes the full-file path.
+                break
+            }
+
+            if !finishRequested {
+                // A 2-second ceiling trades power for bounded latency; it is NOT a fixed 2/3
+                // duty cycle on a slow model. Skip idle while a complete window is backlogged.
+                let backlog = recorder.accumulatedSampleCount - lastTranscribedEnd
+                if backlog < Self.forceChunkSamples {
+                    try? await Task.sleep(for: .seconds(min(2, max(0.35, inferenceDuration * 0.5))))
+                }
+            }
+        }
+    }
+
+    private func publishLive(_ publication: LiveTranscriptionAssembler.Publication) {
+        let oldTail = liveSegments[publication.replacingFrom...]
+        let unchanged = oldTail.count == publication.segments.count &&
+            zip(oldTail, publication.segments).allSatisfy {
+                $0.start == $1.start && $0.end == $1.end && $0.text == $1.text
+            }
+        if !unchanged {
+            nextTextDirtyFrom = publication.replacingFrom
+            liveSegments.replaceSubrange(publication.replacingFrom..<liveSegments.count,
+                                         with: publication.segments)
+            // Interim translations belong to a mutable tail. Drop only the first
+            // changed suffix; never scan or rebuild the immutable history.
+            let start = min(translationNextIndex, publication.replacingFrom)
+            var valid = min(start, liveTranslatedSourceTexts.count)
+            while valid < liveTranslatedSourceTexts.count, valid < liveSegments.count,
+                  liveTranslatedSourceTexts[valid] == liveSegments[valid].text.trimmingCharacters(in: .whitespaces) {
+                valid += 1
+            }
+            if valid < liveTranslatedSegments.count {
+                liveTranslatedSegments.removeSubrange(valid...)
+                liveTranslatedSourceTexts.removeSubrange(valid...)
+            }
+        }
+        liveSealedSegmentCount = publication.sealedCount
+    }
+
+    nonisolated private static func isWaitingForService(_ error: TranscriptionExecutionError) -> Bool {
+        switch error {
+        case .busy, .queuedTimedOut: return true
+        case .timedOut: return false
+        }
+    }
+
+    nonisolated static func liveFailureMessage(_ error: Error) -> String {
+        let suggestion: String
+        if error is TranscriptionExecutionError {
+            suggestion = "请先结束录音保存；若有文件/API转录任务，请等待其完成后重新抓取，仍无响应再重启应用"
+        } else if case TranscriptionError.modelNotFound = error {
+            suggestion = "请在设置中下载或重新选择模型，再重新抓取音频"
+        } else if case TranscriptionError.processFailed = error {
+            suggestion = "请检查模型文件及语言设置，必要时重新下载模型，再重新抓取音频"
+        } else {
+            suggestion = "请结束录音保存后重新抓取；反复失败时换用较小模型或重启应用"
+        }
+        return "【\(suggestion)】实时识别无法继续；录音继续，结束后将尝试从录音补转。原因：\(error.localizedDescription)"
+    }
+
+    /// Cancel discards the current session; Finish uses the drain path above instead.
     func stopLiveTranscription() {
+        guard !isFinishingRecording else { return }
+        resetLiveSession(removeRecovery: true)
+    }
+
+    private func resetLiveSession(removeRecovery: Bool) {
+        liveSessionID = nil
         liveTranscriptionTask?.cancel()
         liveTranscriptionTask = nil
-        // Free the dedicated live model (if one was loaded) — the final file
-        // transcription uses the main model.
+        invalidateTranslationWorker()
         service.unloadLiveModel()
-        liveTranslationTask?.cancel()
-        liveTranslationTask = nil
-        pendingTranslationSnapshot = nil
-        isTranslationWorkerRunning = false
+        liveRecorder = nil
+        finishRequested = false
         translationFailureCount = 0
         translationAuthPaused = false
         isLiveTranscribing = false
         liveError = nil
         liveTranslationError = nil
-        // Clear live results (the final file transcription will replace them)
         liveSegments = []
         liveTranslatedSegments = []
         liveTranslatedSourceTexts = []
-        liveTranslatedSealCount = []
+        liveSealedSegmentCount = 0
+        translationNextIndex = 0
+        liveTranslationLanguage = nil
         enableLiveTranslation = false
         liveTranslationPaused = false
-        removeLiveRecoveryFile()
-    }
-
-    /// Punctuation/whitespace whisper sprinkles at chunk edges; ignored when matching an overlap.
-    private static let overlapTrimChars = CharacterSet(
-        charactersIn: "，。、！？；：「」『』（）()【】［］…—~,.!?;:'\" \t\n")
-
-    /// Trim the leading portion of `current` that duplicates the trailing portion of `previous`.
-    /// Produced when a forced chunk re-transcribes the 1s context overlap. The match floor is a
-    /// single character (Mandarin is dense — the previous 4-char floor missed most overlaps) and
-    /// boundary punctuation/whitespace is stripped so a comma/period whisper added at the cut can't
-    /// block the match.
-    static func trimOverlap(previous: String, current: String) -> String {
-        var source = previous.trimmingCharacters(in: .whitespaces)
-        while let last = source.unicodeScalars.last, overlapTrimChars.contains(last) {
-            source.unicodeScalars.removeLast()
-        }
-        var target = Substring(current.trimmingCharacters(in: .whitespaces))
-        while let first = target.unicodeScalars.first, overlapTrimChars.contains(first) {
-            target = target.dropFirst()
-        }
-        let maxCheck = min(source.count, target.count)
-        guard maxCheck >= 1 else { return current }
-        for len in stride(from: maxCheck, through: 1, by: -1) {
-            if target.hasPrefix(String(source.suffix(len))) {
-                return String(target.dropFirst(len))
-            }
-        }
-        return current
+        if removeRecovery { removeLiveRecoveryFile() }
     }
 
     // MARK: - Live Transcription Auto-Save (crash recovery)
 
-    private static var liveRecoveryURL: URL {
+    nonisolated private static var liveRecoveryURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return appSupport
             .appendingPathComponent("WhisperASR", isDirectory: true)
@@ -661,7 +826,7 @@ class AppState {
 
     private struct LiveRecoveryData: Codable {
         let segments: [TranscriptionSegment]
-        let fullText: String
+        let fullText: String?
         let translatedSegments: [String]
         let translationLanguage: String?
         let savedAt: Date
@@ -671,7 +836,8 @@ class AppState {
     @MainActor
     private func throttledAutoSave() {
         let now = Date()
-        guard now.timeIntervalSince(lastAutoSaveTime) >= 15 else { return }
+        guard lastRecoveryRevision != liveTextRevision,
+              !recoverySaveRunning.withLock({ $0 }), now.timeIntervalSince(lastAutoSaveTime) >= 15 else { return }
         lastAutoSaveTime = now
         autoSaveLiveTranscription()
     }
@@ -679,256 +845,221 @@ class AppState {
     /// Persist current live transcription to a recovery file so data survives a hang or crash.
     @MainActor
     private func autoSaveLiveTranscription() {
+        recoverySaveRunning.withLock { $0 = true }
         let segments = liveSegments
-        let text = segments.map { $0.text }.joined()
         let translations = liveTranslatedSegments
-        let lang: String? = !translations.isEmpty
-            ? UserDefaults.standard.string(forKey: "targetLanguage") : nil
+        let revision = liveTextRevision
+        let session = liveSessionID
+        let lang = liveTranslationLanguage
+        let url = recoveryURL
 
         // Write on a background queue to avoid blocking the main thread
-        Task.detached(priority: .utility) {
+        let running = recoverySaveRunning
+        Self.recoveryQueue.async {
+            defer { running.withLock { $0 = false } }
             let data = LiveRecoveryData(
-                segments: segments, fullText: text,
+                segments: segments, fullText: nil,
                 translatedSegments: translations, translationLanguage: lang,
                 savedAt: Date()
             )
             let encoder = JSONEncoder()
-            encoder.outputFormatting = .sortedKeys
             guard let json = try? encoder.encode(data) else { return }
-            let url = AppState.liveRecoveryURL
             try? FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? json.write(to: url, options: .atomic)
+            do {
+                try json.write(to: url, options: .atomic)
+                Task { @MainActor [weak self] in
+                    if self?.liveSessionID == session { self?.lastRecoveryRevision = revision }
+                }
+            } catch {
+                print("[LiveRecovery] Save failed: \(error.localizedDescription)")
+            }
         }
     }
 
     private func removeLiveRecoveryFile() {
-        try? FileManager.default.removeItem(at: Self.liveRecoveryURL)
+        // Ordered after any in-flight save, so it cannot recreate a finished session.
+        let url = recoveryURL
+        Self.recoveryQueue.async {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     /// Check if there is a recoverable live transcription from a previous crash/hang.
     var hasLiveRecoveryData: Bool {
-        FileManager.default.fileExists(atPath: Self.liveRecoveryURL.path)
+        FileManager.default.fileExists(atPath: recoveryURL.path)
     }
 
     /// Import recovered live transcription as a completed transcription item.
     func importRecoveredTranscription() {
-        let url = Self.liveRecoveryURL
+        let url = recoveryURL
         guard let data = try? Data(contentsOf: url),
               let recovery = try? JSONDecoder().decode(LiveRecoveryData.self, from: data)
         else { return }
         let item = TranscriptionItem(
             fileURL: URL(fileURLWithPath: "/recovered-\(ISO8601DateFormatter().string(from: recovery.savedAt))"))
         item.segments = recovery.segments
-        item.fullText = recovery.fullText
+        item.fullText = recovery.fullText ?? recovery.segments.map(\.text).joined()
         item.translatedSegments = recovery.translatedSegments
         item.translationLanguage = recovery.translationLanguage
         item.status = .completed
         item.fileName = "Recovered \(DateFormatter.localizedString(from: recovery.savedAt, dateStyle: .short, timeStyle: .short))"
         items.insert(item, at: 0)
         selectedItemID = item.id
-        TranscriptionStore.save(item)
-        removeLiveRecoveryFile()
+        if TranscriptionStore.save(item) { removeLiveRecoveryFile() }
     }
 
     // MARK: - Live Translation
 
-    /// Queue the latest translation snapshot. Since each snapshot is cumulative
-    /// (contains all segments so far), a newer one always supersedes an older one,
-    /// so we keep only the most recent. A single worker drains this slot.
-    /// Pause or resume live translation on demand. When resuming, everything
-    /// spoken during the pause is marked as already handled (sealed) so the
-    /// dirty-scan won't retroactively translate the skipped (native-language)
-    /// portion — only segments transcribed from here on get translated.
-    @MainActor
     func setLiveTranslationPaused(_ paused: Bool) {
         guard liveTranslationPaused != paused else { return }
         liveTranslationPaused = paused
-        if paused {
-            // Stop calling the API immediately by dropping any queued snapshot.
-            pendingTranslationSnapshot = nil
-        } else {
-            // Seal the current segments so they're not retranslated on resume.
-            let texts = liveSegments.map { $0.text.trimmingCharacters(in: .whitespaces) }
-            let n = texts.count
-            if liveTranslatedSegments.count < n {
-                liveTranslatedSegments += Array(repeating: "", count: n - liveTranslatedSegments.count)
-            }
-            liveTranslatedSourceTexts = texts
-            liveTranslatedSealCount = Array(repeating: Self.sealThreshold, count: n)
-            // Kick the worker so subsequent segments resume translating.
-            if isLiveTranscribing { enqueueLiveTranslation(liveSegments, countsSeals: true) }
+        invalidateTranslationWorker()
+        if !paused {
+            // Use captured time, not the mutable segment count: late finalization of speech
+            // from the pause must not slip into a resumed request.
+            translationResumeTime = Double(liveRecorder?.accumulatedSampleCount ?? 0) / 16000
+            enqueueLiveTranslation()
         }
     }
 
-    @MainActor
-    private func enqueueLiveTranslation(_ segments: [TranscriptionSegment], countsSeals: Bool) {
-        guard !translationAuthPaused, !liveTranslationPaused else { return }
-        // A superseded seal-anchored snapshot keeps its seal-counting duty: the
-        // newer segments are cumulative, so counting seals on them is equivalent.
-        let carrySeals = countsSeals || (pendingTranslationSnapshot?.countsSeals ?? false)
-        pendingTranslationSnapshot = (segments: segments, countsSeals: carrySeals)
-        guard !isTranslationWorkerRunning else { return }
-        isTranslationWorkerRunning = true
+    private func invalidateTranslationWorker() {
+        translationEpoch &+= 1
+        liveTranslationTask?.cancel()
+        liveTranslationTask = nil
+        lastInterimTranslation = .distantPast
+        lastInterimTexts = []
+        lastInterimStart = -1
+    }
+
+    private func translationWorkerIsCurrent(_ epoch: UInt64) -> Bool {
+        !Task.isCancelled && epoch == translationEpoch && liveSessionID != nil &&
+            enableLiveTranslation && !liveTranslationPaused && !translationAuthPaused
+    }
+
+    /// Immutable batches advance a monotonic cursor; interim batches only replace
+    /// the bounded mutable tail. Both share one worker and the same retry budget.
+    private func enqueueLiveTranslation() {
+        guard liveTranslationTask == nil, translationWorkerIsCurrent(translationEpoch),
+              translationNextIndex < liveSegments.count else { return }
+        let epoch = translationEpoch
         liveTranslationTask = Task { [weak self] in
-            await self?.drainTranslationQueue()
+            await self?.drainTranslationQueue(epoch: epoch)
         }
     }
 
-    private func drainTranslationQueue() async {
-        while !Task.isCancelled {
-            let next: (segments: [TranscriptionSegment], countsSeals: Bool)? = await MainActor.run { [weak self] in
-                guard let self else { return nil }
-                if let snapshot = self.pendingTranslationSnapshot {
-                    self.pendingTranslationSnapshot = nil
-                    return snapshot
+    private func drainTranslationQueue(epoch: UInt64) async {
+        defer {
+            // An old canceled worker must not clear the handle of its replacement.
+            if epoch == translationEpoch { liveTranslationTask = nil }
+        }
+        while translationWorkerIsCurrent(epoch), translationNextIndex < liveSegments.count {
+            if translationFailureCount > 0 {
+                let milliseconds = Self.translationRetryDelayMilliseconds(failureCount: translationFailureCount)
+                try? await Task.sleep(for: .milliseconds(milliseconds))
+                guard translationWorkerIsCurrent(epoch) else { return }
+            }
+            let target = UserDefaults.standard.string(forKey: "targetLanguage") ?? ""
+            guard !target.isEmpty else { return }
+            if let previous = liveTranslationLanguage, previous != target {
+                translationAuthPaused = true
+                liveTranslationError = "【请结束本次录音，再重新抓取】翻译目标语言已改变，为避免混合语言结果，本次翻译已停止。原文识别继续。"
+                return
+            }
+            liveTranslationLanguage = target
+
+            while translationNextIndex < liveSegments.count,
+                  liveSegments[translationNextIndex].start < translationResumeTime {
+                guard translationNextIndex < liveSealedSegmentCount else { return }
+                nextTextDirtyFrom = translationNextIndex
+                liveTranslatedSegments.replaceSubrange(translationNextIndex..<liveTranslatedSegments.count, with: [""])
+                liveTranslatedSourceTexts.replaceSubrange(translationNextIndex..<liveTranslatedSourceTexts.count,
+                    with: [liveSegments[translationNextIndex].text.trimmingCharacters(in: .whitespaces)])
+                translationNextIndex += 1
+            }
+            let start = translationNextIndex
+            let interim = start >= liveSealedSegmentCount
+            let end = min(start + 24, interim ? liveSegments.count : liveSealedSegmentCount)
+            guard end > start else { return }
+            let texts = liveSegments[start..<end].map { $0.text.trimmingCharacters(in: .whitespaces) }
+            if interim {
+                if translationFailureCount > 0 {
+                    let remaining = Self.interimTranslationInterval - Date().timeIntervalSince(lastInterimTranslation)
+                    if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
+                    guard translationWorkerIsCurrent(epoch) else { return }
                 }
-                self.isTranslationWorkerRunning = false
-                return nil
+                guard !finishRequested,
+                      Date().timeIntervalSince(lastInterimTranslation) >= Self.interimTranslationInterval,
+                      start != lastInterimStart || texts != lastInterimTexts else { return }
+                lastInterimTranslation = Date()
             }
-            guard let (segments, countsSeals) = next else { return }
-            if segments.isEmpty { continue }
-            let targetLang = UserDefaults.standard.string(forKey: "targetLanguage") ?? ""
-            guard !targetLang.isEmpty else { continue }
-            await translateLiveSegments(segments, targetLang: targetLang, countsSeals: countsSeals)
-        }
-        await MainActor.run { self.isTranslationWorkerRunning = false }
-    }
-
-    private func translateLiveSegments(_ segments: [TranscriptionSegment], targetLang: String, countsSeals: Bool) async {
-        guard !Task.isCancelled else { return }
-
-        // Exponential backoff on repeated failures (500ms, 1s, 2s, ..., capped at 30s).
-        let failureCount = await MainActor.run { self.translationFailureCount }
-        if failureCount > 0 {
-            let delayMs = min(30_000, 500 * Int(pow(2.0, Double(failureCount - 1))))
-            try? await Task.sleep(for: .milliseconds(delayMs))
-            guard !Task.isCancelled else { return }
-        }
-
-        let texts = segments.map { $0.text.trimmingCharacters(in: .whitespaces) }
-        let (existing, existingSourceTexts, sealCounts) = await MainActor.run {
-            (self.liveTranslatedSegments, self.liveTranslatedSourceTexts, self.liveTranslatedSealCount)
-        }
-
-        // Find the first index where the segment text changed or has no translation.
-        // Segments in the overlap zone may be re-transcribed with different text,
-        // so we need to re-translate from the first divergent segment onward.
-        var firstDirtyIndex = min(existing.count, texts.count)
-        for i in 0..<min(existing.count, existingSourceTexts.count, texts.count) {
-            if texts[i] != existingSourceTexts[i] || existing[i].isEmpty {
-                firstDirtyIndex = i
-                break
+            let context: [(original: String, translated: String)] = (max(0, start - 2)..<start).compactMap { i in
+                guard i < liveTranslatedSegments.count, !liveTranslatedSegments[i].isEmpty else { return nil }
+                return (liveTranslatedSourceTexts[i], liveTranslatedSegments[i])
             }
-        }
-
-        // Sealed segments are never retranslated — bounds the cascade when whisper's
-        // overlap zone shifts an early segment's text yet again after it has stabilized.
-        let firstUnsealedIndex: Int = {
-            for i in 0..<sealCounts.count {
-                if sealCounts[i] < Self.sealThreshold { return i }
-            }
-            return sealCounts.count
-        }()
-        let dirtyIndex = max(firstDirtyIndex, firstUnsealedIndex)
-
-        let textsToTranslate = Array(texts.dropFirst(dirtyIndex))
-        guard !textsToTranslate.isEmpty else {
-            // Nothing to translate, but still need to update seal counts for stable suffix.
-            if countsSeals {
-                await MainActor.run { self.updateSealCounts(newSourceTexts: texts) }
-            }
-            return
-        }
-
-        // Use up to 2 clean translations before the dirty range as context
-        let contextStart = max(0, dirtyIndex - 2)
-        let contextPairs: [(original: String, translated: String)] = (contextStart..<dirtyIndex).compactMap { i in
-            guard i < texts.count, i < existing.count,
-                  !texts[i].isEmpty, !existing[i].isEmpty else { return nil }
-            return (original: texts[i], translated: existing[i])
-        }
-
-        do {
-            let newTranslations = try await TranslationService.translateSegmentsWithOpenAI(
-                segmentTexts: textsToTranslate, targetLanguage: targetLang,
-                previousTranslations: contextPairs)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                self.liveTranslatedSegments = Array(existing.prefix(dirtyIndex)) + newTranslations
-                self.liveTranslatedSourceTexts = Array(texts.prefix(dirtyIndex)) + textsToTranslate
-                if countsSeals {
-                    self.updateSealCounts(newSourceTexts: texts)
+            do {
+                let translated = try await TranslationService.translateSegmentsWithOpenAI(
+                    segmentTexts: texts, targetLanguage: target, previousTranslations: context)
+                guard translationWorkerIsCurrent(epoch) else { return }
+                guard UserDefaults.standard.string(forKey: "targetLanguage") == target else {
+                    liveTranslationError = "【请结束本次录音，再重新抓取】翻译目标语言已改变，本次翻译已停止。原文识别继续。"
+                    translationAuthPaused = true
+                    return
                 }
-                self.translationFailureCount = 0
-                self.liveTranslationError = nil
-            }
-        } catch let err as TranslationError {
-            print("[Translation] OpenAI error: \(err)")
-            await MainActor.run {
-                switch err {
-                case .authFailed, .invalidEndpoint:
-                    // Pause translation entirely — retrying only wastes quota.
-                    self.translationAuthPaused = true
-                    self.liveTranslationError = err.errorDescription
-                    self.pendingTranslationSnapshot = nil
-                default:
-                    self.translationFailureCount += 1
-                    if self.translationFailureCount >= 3 {
-                        self.liveTranslationError = err.errorDescription
+                guard translated.count == texts.count else {
+                    throw NSError(domain: "LiveTranslation", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Translation returned an unexpected segment count."])
+                }
+                guard end <= liveSegments.count,
+                      liveSegments[start..<end].map({ $0.text.trimmingCharacters(in: .whitespaces) }) == texts else { return }
+                nextTextDirtyFrom = start
+                liveTranslatedSegments.replaceSubrange(start..<liveTranslatedSegments.count, with: translated)
+                liveTranslatedSourceTexts.replaceSubrange(start..<liveTranslatedSourceTexts.count, with: texts)
+                if interim {
+                    lastInterimStart = start
+                    lastInterimTexts = texts
+                } else {
+                    translationNextIndex = end
+                }
+                translationFailureCount = 0
+                liveTranslationError = nil
+                if isLiveTranscribing {
+                    throttledAutoSave()
+                } else {
+                    // No live loop remains to flush this revision at the next checkpoint.
+                    // Save each accepted late batch before a later retry or Pause can
+                    // suspend/retire this worker indefinitely.
+                    autoSaveLiveTranscription()
+                }
+            } catch {
+                guard translationWorkerIsCurrent(epoch) else { return }
+                if let error = error as? TranslationError {
+                    switch error {
+                    case .authFailed, .invalidEndpoint, .unavailable:
+                        translationAuthPaused = true
+                        liveTranslationError = "【请检查翻译 API 地址、密钥及权限，修正后重新抓取】翻译配置不可用，原文识别继续。原因：\(error.localizedDescription)"
+                        return
+                    case .apiFailed:
+                        translationAuthPaused = true
+                        liveTranslationError = "【请检查翻译 API 模型名称、参数及配额，修正后重新抓取；无需重启应用】接口拒绝请求，已停止重复提交。原文识别继续。原因：\(error.localizedDescription)"
+                        return
+                    default: break
                     }
                 }
-                // Pad source-text tracking so next cycle can detect segments still needing translation.
-                if self.liveTranslatedSegments.count < texts.count {
-                    self.liveTranslatedSegments += Array(repeating: "", count: texts.count - self.liveTranslatedSegments.count)
-                    self.liveTranslatedSourceTexts += texts.suffix(texts.count - self.liveTranslatedSourceTexts.count)
+                translationFailureCount = min(translationFailureCount + 1, 32)
+                if translationFailureCount >= 5 {
+                    translationAuthPaused = true
+                    liveTranslationError = "【请检查网络、API 配额和模型配置，恢复后重新抓取；无需重启应用】翻译连续失败 5 轮，已停止重试，原文识别继续。原因：\(error.localizedDescription)"
+                    return
                 }
-            }
-        } catch {
-            print("[Translation] error: \(error)")
-            await MainActor.run {
-                self.translationFailureCount += 1
-                if self.translationFailureCount >= 3 {
-                    self.liveTranslationError = error.localizedDescription
-                }
+                liveTranslationError = "【请稍候，正在自动重试；无需重新抓取】翻译暂时失败（\(translationFailureCount)/5），原文识别继续。原因：\(error.localizedDescription)"
             }
         }
     }
 
-    /// Increment seal count for each segment whose source text matches last cycle; reset on change.
-    @MainActor
-    private func updateSealCounts(newSourceTexts: [String]) {
-        var updated: [Int] = []
-        updated.reserveCapacity(newSourceTexts.count)
-        for i in 0..<newSourceTexts.count {
-            if i < liveTranslatedSealCount.count, i < liveTranslatedSourceTexts.count,
-               liveTranslatedSourceTexts[i] == newSourceTexts[i] {
-                updated.append(min(Self.sealThreshold, liveTranslatedSealCount[i] + 1))
-            } else {
-                updated.append(1)
-            }
-        }
-        liveTranslatedSealCount = updated
-    }
-
-    // MARK: - Timeout helper
-
-    private struct TimeoutError: Error {}
-
-    /// Run `operation` with a timeout. If it doesn't complete within `seconds`, throws TimeoutError.
-    private static func withTimeout<T: Sendable>(
-        seconds: Double,
-        operation: @Sendable @escaping () async throws -> T
-    ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(for: .seconds(seconds))
-                throw TimeoutError()
-            }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
-        }
+    nonisolated static func translationRetryDelayMilliseconds(failureCount: Int) -> Int {
+        // Clamp before subtraction, shift and multiply, including Int.max test inputs.
+        let bounded = min(7, max(1, failureCount))
+        return min(30_000, 500 * (1 << (bounded - 1)))
     }
 }

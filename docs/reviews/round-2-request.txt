@@ -1,0 +1,14 @@
+请在本会话做 whisperasr-0.6.2-R2 定向复核。仍然只读源码，可编译和运行独立检查；不修改源码、不 commit/push、不安装/退出应用、不读取用户录音或密钥。
+
+仓库 /Users/min.zheng/Documents/github/whisperASR，HEAD/base 仍为 95edefce6ac790c1beba8652b6dd903991ed8e99。请先核对 .build/reviews/round-2-manifest.txt（32 文件），结束再核对。第 1 轮完整结论已记录 docs/reviews/claude-R1.txt；本轮不必重复旧 commit 全量分析，重点判断下面修复及新回归是否正确、有无新阻挡本机安装的问题。
+
+R1 #1：assembler 所有过滤/静音/force/最终封口统一整数采样域，规范化发布时间戳。Tests/LiveAudioChecks 增加真实 force + silence ULP 复现、多小时非整秒起点和 cut±1 sample。
+R1 #2：非final空/仅旧overlap且有draft时 assembler保留draft和seal，Publication.keptDraftAfterEmpty让loop等待availableEnd增长，防满窗重复热循环；final空只在有待保留draft时标记需文件修复，纯噪声无draft不回退；真正回退先把翻译/lang随草稿保存，失败保留，成功后仅源文本段不一致才clear并提示。Tests/LiveSessionChecks直接编译真实AppState，覆盖噪声final、不清draft、后续恢复、无新音频不反复infer、pending/failed翻译保留、retime但同文保留、异文作废。
+R1 #3：执行器在同一锁下beginExecution，区分.queuedTimedOut/.timedOut。排队仍有期限、最多2pending；live/preload对busy/queued超时等候重试（Finish时转文件pending而不无限等），运行中超时仍停止live以保context独占；API排队超时503，执行超时504。本地文件busy/queue超时保pending。真实executor tests增加零期限、排队对象释放及起跑/到期竞争；AppState tests验证busy/queued等待后继续live。
+R1 #4：保存期间录音URL明确拒绝并toast要求稍后重试，异步查找应用返回后再次guard；Finish只把仍saving的录音器置idle。
+R1 #5：先用便宜的capturedEnd做等待门控，再取原子PCM快照；真正解码/扫描仍严格同一个snapshot。
+另外Finish的3秒翻译grace加Task cancellation guard，避免取消后sleep立即失败造成主线程忙转。
+
+已再次通过swift build和四组回归。R1期间还完成真实Large-v3-turbo/Metal smoke：6.38s系统合成英语约1.01s识别；15ms deadline约16ms返回，实际C退出前拒绝重入，随后恢复识别；显式取消同样恢复。未录麦克风、未读会议音频、未改变持久模型设置。边界仍是完整历史COW/JSON、AudioLoader端到端取消、macOS14兼容/长会议CER/WER/功耗未验证。
+
+请给简洁中文结论：逐项是否解决；如果仍有确定问题请给最小复现、行号、修复建议；明确本机安装是否还有阻挡。不要把探针样本中约10%浮点命中率外推为真实会议发生率。
