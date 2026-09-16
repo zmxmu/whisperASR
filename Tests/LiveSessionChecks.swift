@@ -158,12 +158,32 @@ private actor TranslationScenario {
 private enum StubEnvironment {
     static var service = ServiceScenario()
     static var translation = TranslationScenario()
+    static var liveModelDiffers = false
 }
 
 // Hardware, network and durable-store boundaries used by the actual AppState.
+enum SpeakerLibrary {
+    static func knownSpeakerSamples(for ids: [UUID]?) -> [UUID] { ids ?? [] }
+    static func cacheEmbeddings(_ embeddings: [UUID: [Float]]) {}
+}
+enum DiarizationService {
+    struct Result { var extractedEmbeddings: [UUID: [Float]] = [:]; var turns: [Int] = [] }
+    struct Provider {
+        let displayName = "Fixture"
+        func diarize(audioURL: URL, knownSpeakers: [UUID],
+                     progress: @escaping @Sendable (Double) -> Void) async throws -> Result { Result() }
+    }
+    static func provider() -> Provider { Provider() }
+    static func assignSpeakers(to segments: [TranscriptionSegment], turns: [Int]) -> [TranscriptionSegment] { segments }
+}
 final class TranscriptionService: @unchecked Sendable {
+    let liveModelDiffers: Bool
+    func unloadLiveModel() {}
     private let scenario: ServiceScenario
-    @MainActor init() { scenario = StubEnvironment.service }
+    @MainActor init() {
+        scenario = StubEnvironment.service
+        liveModelDiffers = StubEnvironment.liveModelDiffers
+    }
     func preloadModel() async throws { await scenario.preloadModel() }
     func transcribeChunk(samples: [Float], language: String? = nil,
                          timeoutSeconds: TimeInterval? = nil) async throws -> TranscriptionResult {
@@ -261,9 +281,10 @@ struct LiveSessionChecks {
     private static func silent(_ seconds: Double) -> [Float] {
         Array(repeating: 0, count: Int(seconds * 16000))
     }
-    private static func makeSession(_ name: String) -> (AppState, AudioRecorder, ServiceScenario) {
+    private static func makeSession(_ name: String, liveModelDiffers: Bool = false) -> (AppState, AudioRecorder, ServiceScenario) {
         StubEnvironment.service = ServiceScenario()
         StubEnvironment.translation = TranslationScenario()
+        StubEnvironment.liveModelDiffers = liveModelDiffers
         let state = AppState(restoreStoredItems: false,
                              recoveryURL: directory.appendingPathComponent(name + ".json"))
         let recorder = AudioRecorder(url: directory.appendingPathComponent(name + ".m4a"))
@@ -283,6 +304,8 @@ struct LiveSessionChecks {
         }
 
         try await finalTailAfterStop()
+        try await dedicatedLiveModelQueuesMainModel()
+        try await interimTranslationDoesNotSealDraft()
         try await drainLongRecording()
         try await fullWindowDoesNotStall()
         try await timedOutLiveUsesFullFile()
@@ -315,6 +338,45 @@ struct LiveSessionChecks {
         precondition(TranscriptionStore.loadCalls == 0, "Tests must not restore real stored items")
         print("PASS: real AppState final 0.2s tail, >30s drain, full-window progress, true timeout/empty-final recovery, empty background-noise final, transient empty/overlap draft recovery, bounded persistent-empty Finish/live fallback and budget reset, retained-draft cap/recovery checkpoints and late translation flush, busy/queued-timeout retry, repair translation retention/invalidation, cancellable finish grace, translation epochs/worker ownership, bounded Int.max backoff")
         print("Temporary recovery fixtures: \(directory.path)")
+    }
+
+    private static func dedicatedLiveModelQueuesMainModel() async throws {
+        let (state, recorder, service) = makeSession("dedicated-model", liveModelDiffers: true)
+        recorder.buffer.append(speech(1, seconds: 2))
+        state.startLiveTranscription(recorder: recorder)
+        try await eventually("Dedicated live draft missing") { !state.liveSegments.isEmpty }
+        await state.finishRecording(recorder: recorder)
+        try await eventually("Dedicated live model must re-transcribe saved audio") { await service.fileCount() == 1 }
+        precondition(state.items[0].fullText == "词1", "Keep draft visible during main-model pass")
+        await service.releaseFile(result: TranscriptionResult(text: "main model", segments: [
+            TranscriptionSegment(start: 0, end: 2, text: "main model")]))
+        try await eventually("Main-model pass was not published") { state.items[0].fullText == "main model" }
+    }
+
+    private static func interimTranslationDoesNotSealDraft() async throws {
+        let (state, recorder, _) = makeSession("interim-translation")
+        let translation = StubEnvironment.translation
+        state.enableLiveTranslation = true
+        recorder.buffer.append(speech(1, seconds: 2))
+        state.startLiveTranscription(recorder: recorder)
+        try await eventually("Unsealed speech should translate before a pause") { await translation.count() == 1 }
+        await translation.complete(0, prefix: "INTERIM")
+        try await eventually("Interim translation missing") { state.liveTranslatedSegments.first == "INTERIM词1" }
+        recorder.buffer.append(speech(2))
+        try await eventually("ASR draft did not grow") { state.liveSegments.count == 2 }
+        let requests = await translation.count()
+        precondition(requests == 1, "Interim translations must be debounced")
+        try await Task.sleep(for: .milliseconds(2100))
+        recorder.buffer.append(speech(3))
+        try await eventually("Changed interim tail was not translated") { await translation.count() == 2 }
+        await translation.complete(1, prefix: "INTERIM")
+        try await eventually("Updated interim translation missing") { state.liveTranslatedSegments.count == 3 }
+        let finish = Task { await state.finishRecording(recorder: recorder) }
+        try await eventually("Interim translation must not prematurely seal the source") { await translation.count() == 3 }
+        await translation.complete(2, prefix: "FINAL")
+        await finish.value
+        precondition(state.items[0].translatedSegments == ["FINAL词1", "FINAL词2", "FINAL词3"])
+        print("PASS: dedicated live model final re-transcription; debounced interim translation without premature sealing")
     }
 
     private static func finalTailAfterStop() async throws {

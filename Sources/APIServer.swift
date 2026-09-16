@@ -10,7 +10,7 @@ import FlyingSocks
 ///
 /// Endpoints:
 ///   - `POST /v1/audio/transcriptions`  (multipart/form-data: `file`, optional `model`,
-///     `language`, `response_format` = json | verbose_json | text | srt | vtt)
+///     `language`, `response_format` = json | verbose_json | text | srt | vtt | sub)
 ///   - `POST /v1/audio/translations`    (same, but translates the audio to English)
 ///   - `GET  /v1/models`
 ///
@@ -364,9 +364,11 @@ private struct OpenAITranscriptionAPI: Sendable {
         case "text":
             return textResponse(text)
         case "srt":
-            return textResponse(makeSRT(result.segments), contentType: "application/x-subrip")
+            return textResponse(SubtitleFormatter.makeSRT(result.segments), contentType: "application/x-subrip")
         case "vtt":
-            return textResponse(makeVTT(result.segments), contentType: "text/vtt; charset=utf-8")
+            return textResponse(SubtitleFormatter.makeVTT(result.segments), contentType: "text/vtt; charset=utf-8")
+        case "sub":
+            return textResponse(SubtitleFormatter.makeSUB(result.segments), contentType: "text/plain; charset=utf-8")
         case "verbose_json":
             let duration = result.segments.last?.end ?? 0
             let segs = result.segments.enumerated().map { index, s in
@@ -400,44 +402,6 @@ private struct OpenAITranscriptionAPI: Sendable {
     static func errorResponse(_ status: HTTPStatusCode, _ message: String,
                               type: String = "invalid_request_error") -> HTTPResponse {
         jsonResponse(status, APIError(error: .init(message: message, type: type, code: nil)))
-    }
-
-    // MARK: Subtitles
-
-    static func makeSRT(_ segments: [TranscriptionSegment]) -> String {
-        var out = ""
-        for (i, seg) in segments.enumerated() {
-            let line = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            out += "\(i + 1)\n"
-            out += "\(srtTime(seg.start)) --> \(srtTime(seg.end ?? seg.start))\n"
-            out += "\(line)\n\n"
-        }
-        return out
-    }
-
-    static func makeVTT(_ segments: [TranscriptionSegment]) -> String {
-        var out = "WEBVTT\n\n"
-        for seg in segments {
-            let line = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            out += "\(vttTime(seg.start)) --> \(vttTime(seg.end ?? seg.start))\n"
-            out += "\(line)\n\n"
-        }
-        return out
-    }
-
-    private static func clockParts(_ t: Double) -> (h: Int, m: Int, s: Int, ms: Int) {
-        let total = Int((max(0, t) * 1000).rounded())
-        return (total / 3_600_000, (total % 3_600_000) / 60_000, (total % 60_000) / 1000, total % 1000)
-    }
-
-    static func srtTime(_ t: Double) -> String {
-        let p = clockParts(t)
-        return String(format: "%02d:%02d:%02d,%03d", p.h, p.m, p.s, p.ms)
-    }
-
-    static func vttTime(_ t: Double) -> String {
-        let p = clockParts(t)
-        return String(format: "%02d:%02d:%02d.%03d", p.h, p.m, p.s, p.ms)
     }
 
     // MARK: Upload extension inference

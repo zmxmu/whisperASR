@@ -218,6 +218,34 @@ struct TranscriptionCancellationChecks {
             }
         }
 
+        // Async Core ML work must hold the physical slot after the caller's
+        // deadline, including work suspended at an actor await.
+        let asyncQueue = CancellableTranscriptionQueue(label: "checks.async")
+        let asyncCall = Task {
+            try await asyncQueue.performAsync(timeoutSeconds: 0.04) { cancellation in
+                probe.mark("async-started")
+                try await Task.sleep(for: .milliseconds(200))
+                probe.mark("async-returned")
+                try cancellation.checkCancellation()
+                return 10
+            }
+        }
+        try await eventually { probe.count("async-started") == 1 }
+        await expectFailure(asyncCall, matching: isTimeout)
+        let overlapping = Task {
+            try await asyncQueue.performAsync(timeoutSeconds: 1) { _ in
+                probe.mark("async-overlap")
+                return 11
+            }
+        }
+        await expectFailure(overlapping, matching: isBusy)
+        precondition(probe.count("async-overlap") == 0)
+        try await eventually { probe.count("async-returned") == 1 }
+        try await eventually { (try? asyncQueue.checkAvailability()) != nil }
+        let asyncResult = try await asyncQueue.performAsync(timeoutSeconds: 1) { _ in 12 }
+        precondition(asyncResult == 12)
+        asyncQueue.shutdown()
+
         queue.shutdown()
         let afterShutdown = Task {
             try await queue.perform(timeoutSeconds: 1) { _ in 9 }

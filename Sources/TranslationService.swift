@@ -39,16 +39,18 @@ enum TranslationError: LocalizedError {
     case parseError
     case unavailable
 
+    // Worded generically ("API error", not "Translation API error") because the
+    // meeting-minutes feature shares this client and surfaces the same errors.
     var errorDescription: String? {
         switch self {
         case .invalidEndpoint: return "Invalid API endpoint URL"
-        case .apiFailed(let msg): return "Translation API error: \(msg)"
+        case .apiFailed(let msg): return "API error: \(msg)"
         case .authFailed(let msg): return "API key invalid or unauthorized: \(msg)"
-        case .rateLimited(let msg): return "Translation rate-limited: \(msg)"
-        case .serverError(let code, let msg): return "Translation service error (HTTP \(code)): \(msg)"
-        case .transport(let msg): return "Translation network error: \(msg)"
-        case .parseError: return "Failed to parse translation response"
-        case .unavailable: return "Translation requires OpenAI API configuration"
+        case .rateLimited(let msg): return "Rate-limited by the API: \(msg)"
+        case .serverError(let code, let msg): return "API service error (HTTP \(code)): \(msg)"
+        case .transport(let msg): return "Network error: \(msg)"
+        case .parseError: return "Failed to parse the API response"
+        case .unavailable: return "Requires an OpenAI-compatible API — set the API key in Settings"
         }
     }
 
@@ -62,6 +64,21 @@ enum TranslationError: LocalizedError {
 }
 
 enum TranslationService {
+    /// Builds a request URL from the user's configured endpoint (defaulting to
+    /// OpenAI), appending `path` unless the endpoint already ends with it. One
+    /// "OpenAI API" setting serves every consumer — translation, meeting minutes
+    /// and remote diarization — so the endpoint is derived in exactly one place.
+    static func apiURL(appending path: String) -> URL? {
+        let endpoint = (UserDefaults.standard.string(forKey: "translationEndpoint") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var base = endpoint.isEmpty ? "https://api.openai.com/v1" : endpoint
+        if !base.hasSuffix(path) {
+            if !base.hasSuffix("/") { base += "/" }
+            base += path
+        }
+        return URL(string: base)
+    }
+
     static func translateSegmentsWithOpenAI(
         segmentTexts: [String],
         targetLanguage: String,
@@ -69,18 +86,11 @@ enum TranslationService {
     ) async throws -> [String] {
         guard !segmentTexts.isEmpty else { return [] }
 
-        let endpoint = (UserDefaults.standard.string(forKey: "translationEndpoint") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let apiKey = UserDefaults.standard.string(forKey: "translationAPIKey") ?? ""
         let model = (UserDefaults.standard.string(forKey: "translationModel") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var baseURL = endpoint.isEmpty ? "https://api.openai.com/v1" : endpoint
-        if !baseURL.hasSuffix("/chat/completions") {
-            if !baseURL.hasSuffix("/") { baseURL += "/" }
-            baseURL += "chat/completions"
-        }
         let effectiveModel = model.isEmpty ? "gpt-4o-mini" : model
 
-        guard let url = URL(string: baseURL) else {
+        guard let url = apiURL(appending: "chat/completions") else {
             throw TranslationError.invalidEndpoint
         }
 
@@ -147,7 +157,8 @@ enum TranslationService {
 
     /// Send the request with up to 2 retries (3 attempts total) for transient failures
     /// (URLSession transport errors and 5xx). Auth/client errors are never retried.
-    private static func performRequestWithRetry(_ request: URLRequest) async throws -> Data {
+    /// Shared with MeetingMinutesService, which talks to the same API.
+    static func performRequestWithRetry(_ request: URLRequest) async throws -> Data {
         let backoffs: [Duration] = [.milliseconds(500), .milliseconds(1500)]
         var attempt = 0
         while true {

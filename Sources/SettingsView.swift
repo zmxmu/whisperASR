@@ -10,6 +10,11 @@ struct SettingsView: View {
     @AppStorage("translationModel") private var translationModel = ""
     @AppStorage(RecognitionLanguageMode.defaultsKey) private var recognitionLanguageMode = RecognitionLanguageMode.mandarinEnglish.rawValue
 
+    @AppStorage(DiarizationService.useRemoteKey) private var diarizationUseRemote = false
+    /// The voice library has no observable store, so the list is snapshotted when
+    /// Settings opens and kept in step as the user deletes from it.
+    @State private var knownSpeakers: [SpeakerProfile] = []
+
     // Local OpenAI-compatible API server
     @AppStorage(APIServer.enabledKey) private var apiServerEnabled = false
     @AppStorage(APIServer.portKey) private var apiServerPort = 8080
@@ -25,6 +30,12 @@ struct SettingsView: View {
     @State private var backupStatus: BackupStatus? = nil
     @State private var pendingRestore: BackupService.BackupFile? = nil
     @State private var showRestoreConfirm = false
+
+    // Meeting minutes
+    @State private var minutesStore = MinutesPromptStore.shared
+    @AppStorage(MinutesPromptStore.contextTokensKey) private var minutesContextTokens = MinutesPromptStore.defaultContextTokens
+    @State private var editingPrompt: MinutesPrompt? = nil
+    @State private var promptPendingDelete: MinutesPrompt? = nil
 
     private enum VerifyResult {
         case success(String)
@@ -76,7 +87,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("OpenAI Translation API") {
+            Section("OpenAI API (Translation & Meeting Minutes)") {
                 TextField("API Endpoint", text: $translationEndpoint,
                           prompt: Text("https://api.openai.com/v1"))
                     .textFieldStyle(.roundedBorder)
@@ -89,7 +100,7 @@ struct SettingsView: View {
                           prompt: Text("gpt-4o-mini"))
                     .textFieldStyle(.roundedBorder)
                     .onChange(of: translationModel) { _, _ in verifyResult = nil }
-                Text("Only API Key is required. Endpoint defaults to OpenAI, model defaults to gpt-4o-mini.")
+                Text("Used for translation and meeting minutes. Only API Key is required. Endpoint defaults to OpenAI, model defaults to gpt-4o-mini.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -119,6 +130,97 @@ struct SettingsView: View {
                         EmptyView()
                     }
                     Spacer()
+                }
+            }
+
+            Section("Meeting Minutes") {
+                ForEach(minutesStore.prompts) { prompt in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(prompt.name)
+                            Text(prompt.prompt)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer()
+                        Button {
+                            editingPrompt = prompt
+                        } label: {
+                            Image(systemName: "pencil")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Edit prompt")
+
+                        Button {
+                            promptPendingDelete = prompt
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(minutesStore.prompts.count == 1)
+                        .help(minutesStore.prompts.count == 1
+                              ? "The last prompt can't be deleted" : "Delete prompt")
+                    }
+                }
+
+                Button("Add Prompt…") {
+                    editingPrompt = MinutesPrompt(name: "", prompt: "")
+                }
+
+                HStack {
+                    Text("Model context window")
+                    Spacer()
+                    TextField("16000", value: $minutesContextTokens, format: .number.grouping(.never))
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 90)
+                        .textFieldStyle(.roundedBorder)
+                    Text("tokens")
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("Prompts appear in the Meeting Minutes menu above the transcript. Transcripts longer than the context window are summarized in chunks first, then combined into the minutes. Uses the OpenAI API configured above.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Speakers") {
+                Picker("Diarization Engine", selection: $diarizationUseRemote) {
+                    Text("On-device").tag(false)
+                    Text("OpenAI").tag(true)
+                }
+                .pickerStyle(.segmented)
+                Text(diarizationUseRemote
+                     ? "Uploads the recording to OpenAI's gpt-4o-transcribe-diarize (25 MB limit, at most 4 known voices per run) using the API key above. More accurate on crowded conversations."
+                     : "Identifies speakers entirely on this Mac using the Neural Engine. No key, no upload; the models download on first use.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if knownSpeakers.isEmpty {
+                    Text("No known voices yet. Name the speakers on a transcript and the app keeps a short clip of each one to recognize them next time.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(knownSpeakers) { speaker in
+                        HStack(spacing: 10) {
+                            Circle()
+                                .fill(Color(nsColor: NSColor(hexString: speaker.colorHex) ?? .systemGray))
+                                .frame(width: 10, height: 10)
+                            Text(speaker.name)
+                            Spacer()
+                            Text("\(speaker.recordingCount) recording\(speaker.recordingCount == 1 ? "" : "s")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button {
+                                SpeakerLibrary.deleteSpeaker(id: speaker.id)
+                                knownSpeakers = SpeakerLibrary.speakers
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Forget this voice and its samples")
+                        }
+                    }
                 }
             }
 
@@ -238,6 +340,32 @@ struct SettingsView: View {
         } message: {
             Text("This overwrites your current settings (model choice, translation API config, font size, recent apps) with the values from the backup. Your transcriptions are not affected.")
         }
+        .sheet(item: $editingPrompt) { prompt in
+            MinutesPromptEditorSheet(prompt: prompt) { saved in
+                minutesStore.upsert(saved)
+            }
+        }
+        .confirmationDialog(
+            "Delete \"\(promptPendingDelete?.name ?? "")\"?",
+            isPresented: Binding(
+                get: { promptPendingDelete != nil },
+                set: { if !$0 { promptPendingDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                if let prompt = promptPendingDelete {
+                    minutesStore.delete(prompt)
+                }
+                promptPendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) { promptPendingDelete = nil }
+        } message: {
+            Text("The prompt text will be removed. This can't be undone.")
+        }
+        .onAppear {
+            knownSpeakers = SpeakerLibrary.speakers
+        }
     }
 
     private func verifyConnection() {
@@ -332,6 +460,59 @@ struct SettingsView: View {
         BackupService.restore(backup)
         backupStatus = .success("Settings restored.")
         pendingRestore = nil
+    }
+}
+
+// MARK: - Minutes Prompt Editor
+
+private struct MinutesPromptEditorSheet: View {
+    @State var prompt: MinutesPrompt
+    let onSave: (MinutesPrompt) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var canSave: Bool {
+        !prompt.name.trimmingCharacters(in: .whitespaces).isEmpty
+            && !prompt.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Meeting Minutes Prompt")
+                .font(.headline)
+
+            TextField("Name (e.g. Weekly Standup, Client Call)", text: $prompt.name)
+                .textFieldStyle(.roundedBorder)
+
+            TextEditor(text: $prompt.prompt)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color(nsColor: .separatorColor))
+                )
+                .frame(minHeight: 220)
+
+            Text("Describe the structure and focus of the minutes. The transcript is appended automatically, and the result is always formatted as HTML.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Save") {
+                    onSave(prompt)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canSave)
+            }
+        }
+        .padding(20)
+        .frame(width: 480, height: 420)
     }
 }
 

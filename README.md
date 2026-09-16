@@ -47,7 +47,7 @@ A native macOS app for audio transcription using [Breeze-ASR-25](https://github.
 
 ### Models
 
-- **Downloadable model catalog** — download models in-app: Breeze-ASR-25 (best for Mandarin/Taiwanese-accented speech) plus official whisper.cpp models from Tiny (78 MB) to Large v3 Turbo (1.6 GB)
+- **Downloadable model catalog** — download models in-app: Breeze-ASR-25 (best for Mandarin/Taiwanese-accented speech), NVIDIA Nemotron 3.5 Multilingual (~40 languages with native punctuation, runs on the Apple Neural Engine via Core ML), plus official whisper.cpp models from Tiny (78 MB) to Large v3 Turbo (1.6 GB)
 - **Switch anytime** — pick the active model from the toolbar or Settings; takes effect on the next transcription
 - **Custom model path** — point to any `ggml-*.bin` outside the catalog via Settings
 

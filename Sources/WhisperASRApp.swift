@@ -53,6 +53,12 @@ struct WhisperASRApp: App {
         .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
 
+        Window("Meeting Minutes", id: "minutes") {
+            MinutesWindowView()
+                .environment(appState)
+        }
+        .defaultSize(width: 720, height: 820)
+
         Settings {
             SettingsView()
         }

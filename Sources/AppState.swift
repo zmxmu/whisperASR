@@ -55,6 +55,9 @@ class AppState {
     private var translationEpoch: UInt64 = 0
     private var translationResumeTime = 0.0
     private var liveTranslationLanguage: String?
+    private var lastInterimTranslation = Date.distantPast
+    private var lastInterimTexts: [String] = []
+    private var lastInterimStart = -1
 
     private let service = TranscriptionService()
     private var isTranscribing = false
@@ -65,6 +68,7 @@ class AppState {
     private weak var liveRecorder: AudioRecorder?
     private var finishRequested = false
     private var liveNeedsFilePass = false
+    private var liveUsedDifferentModel = false
     private(set) var isFinishingRecording = false
     private var translationFailureCount = 0
     private var translationAuthPaused = false
@@ -81,6 +85,11 @@ class AppState {
     /// the live tail rather than waiting longer. Kept well under `maxChunkSamples` so the live tail
     /// is always transcribed and no audio is silently dropped.
     private static let forceChunkSamples = 16000 * 12
+    /// Minimum spacing between interim (mid-utterance) live-translation passes.
+    /// Seal-anchored passes are not throttled. Streaming engines like Nemotron
+    /// finish transcription passes in well under a second, so this is what sets
+    /// the effective translation cadence; whisper's slower passes self-limit.
+    private static let interimTranslationInterval: TimeInterval = 2.0
 
     init(restoreStoredItems: Bool = true, recoveryURL: URL? = nil) {
         self.recoveryURL = recoveryURL ?? Self.liveRecoveryURL
@@ -118,6 +127,7 @@ class AppState {
     }
 
     func retranscribe(_ item: TranscriptionItem) {
+        cancelDiarization(for: item)
         item.segments = []
         item.fullText = ""
         item.progress = 0
@@ -188,7 +198,8 @@ class AppState {
 
         // Give the final sealed batch a short opportunity to finish, but never make
         // saving audio depend indefinitely on network/auth availability.
-        if enableLiveTranslation && !liveTranslationPaused && !translationAuthPaused {
+        if enableLiveTranslation && !liveTranslationPaused && !translationAuthPaused,
+           translationNextIndex < liveSealedSegmentCount {
             enqueueLiveTranslation()
             let deadline = ContinuousClock.now.advanced(by: .seconds(3))
             while !Task.isCancelled, liveTranslationTask != nil, ContinuousClock.now < deadline {
@@ -205,7 +216,7 @@ class AppState {
         let lang = translations.contains(where: { !$0.isEmpty }) ? liveTranslationLanguage : nil
         var saved = false
         if let url {
-            if !segments.isEmpty && !liveNeedsFilePass {
+            if !segments.isEmpty && !liveNeedsFilePass && !liveUsedDifferentModel {
                 let item = addFileWithLiveResults(url: url, segments: segments, fullText: fullText,
                     translatedSegments: translations, translationLanguage: lang)
                 saved = TranscriptionStore.save(item)
@@ -329,7 +340,83 @@ class AppState {
         TranscriptionStore.save(item)
     }
 
+    // MARK: - Speaker Diarization
+
+    /// In-flight diarization passes by item id, so removing or re-transcribing an
+    /// item cancels its pass instead of letting it label a transcript that no
+    /// longer wants it.
+    private var diarizationTasks: [UUID: Task<Void, Never>] = [:]
+    private var diarizationEpochs: [UUID: UUID] = [:]
+
+    /// Runs diarization over a finished transcript and labels its segments with
+    /// who spoke. Known voices are enrolled first so recognized speakers come back
+    /// named instead of numbered; `knownSpeakerIDs` narrows that to the people the
+    /// user said are in the recording — nil means the whole library, an empty
+    /// array means enroll nobody ("none of these people are present").
+    ///
+    /// @MainActor: `item` is observed by SwiftUI, so every mutation below must
+    /// land on the main actor; only the engine itself suspends off it.
+    @MainActor
+    func diarizeItem(_ item: TranscriptionItem, knownSpeakerIDs: [UUID]? = nil) {
+        guard !item.segments.isEmpty, !item.isDiarizing else { return }
+        item.isDiarizing = true
+        item.diarizationProgress = 0
+        item.diarizationError = nil
+
+        let knownSpeakers = SpeakerLibrary.knownSpeakerSamples(for: knownSpeakerIDs)
+        let provider = DiarizationService.provider()
+        let epoch = UUID()
+        diarizationEpochs[item.id] = epoch
+
+        diarizationTasks[item.id] = Task { @MainActor in
+            defer {
+                if diarizationEpochs[item.id] == epoch {
+                    item.isDiarizing = false
+                    item.diarizationProgress = 0
+                    diarizationTasks[item.id] = nil
+                    diarizationEpochs[item.id] = nil
+                }
+            }
+            do {
+                let result = try await provider.diarize(
+                    audioURL: item.fileURL,
+                    knownSpeakers: knownSpeakers
+                ) { progress in
+                    Task { @MainActor in
+                        guard self.diarizationEpochs[item.id] == epoch else { return }
+                        item.diarizationProgress = progress
+                    }
+                }
+                // Extraction is the slow part of enrollment; cache what this pass
+                // computed so the next one reuses it.
+                try Task.checkCancellation()
+                guard diarizationEpochs[item.id] == epoch else { return }
+                SpeakerLibrary.cacheEmbeddings(result.extractedEmbeddings)
+                item.segments = DiarizationService.assignSpeakers(to: item.segments,
+                                                                  turns: result.turns)
+                TranscriptionStore.save(item)
+            } catch is CancellationError {
+                // The item was removed or re-transcribed — nothing to report.
+            } catch {
+                guard !Task.isCancelled, diarizationEpochs[item.id] == epoch else { return }
+                print("[Diarization] \(provider.displayName) failed: \(error)")
+                item.diarizationError = error.localizedDescription
+                self.showToast("Couldn't identify speakers: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func cancelDiarization(for item: TranscriptionItem) {
+        diarizationTasks[item.id]?.cancel()
+        diarizationTasks[item.id] = nil
+        diarizationEpochs[item.id] = nil
+        item.isDiarizing = false
+        item.diarizationProgress = 0
+    }
+
     func shutdown() {
+        for task in diarizationTasks.values { task.cancel() }
+        diarizationEpochs.removeAll()
         fileTranscriptionTask?.cancel()
         liveTranscriptionTask?.cancel()
         invalidateTranslationWorker()
@@ -337,6 +424,7 @@ class AppState {
     }
 
     func removeItem(_ item: TranscriptionItem) {
+        cancelDiarization(for: item)
         items.removeAll { $0.id == item.id }
         TranscriptionStore.delete(item)
         if selectedItemID == item.id {
@@ -420,6 +508,7 @@ class AppState {
         liveRecorder = recorder
         finishRequested = false
         liveNeedsFilePass = false
+        liveUsedDifferentModel = service.liveModelDiffers
         liveSegments = []
         liveTranslatedSegments = []
         liveTranslatedSourceTexts = []
@@ -427,6 +516,9 @@ class AppState {
         translationNextIndex = 0
         translationResumeTime = 0
         liveTranslationLanguage = nil
+        lastInterimTranslation = .distantPast
+        lastInterimTexts = []
+        lastInterimStart = -1
         liveError = nil
         liveTranslationError = nil
         translationFailureCount = 0
@@ -542,6 +634,7 @@ class AppState {
                 // Padding is not allowed to extend published timestamps beyond captured audio.
                 var samples = snapshot.samples
                 if samples.count < 16000 { samples += Array(repeating: 0, count: 16000 - samples.count) }
+                liveUsedDifferentModel = liveUsedDifferentModel || service.liveModelDiffers
                 let result = try await service.transcribeChunk(samples: samples, language: language)
                 guard !Task.isCancelled, liveSessionID == session else { return }
                 inferenceFailures = 0
@@ -655,6 +748,18 @@ class AppState {
             nextTextDirtyFrom = publication.replacingFrom
             liveSegments.replaceSubrange(publication.replacingFrom..<liveSegments.count,
                                          with: publication.segments)
+            // Interim translations belong to a mutable tail. Drop only the first
+            // changed suffix; never scan or rebuild the immutable history.
+            let start = min(translationNextIndex, publication.replacingFrom)
+            var valid = min(start, liveTranslatedSourceTexts.count)
+            while valid < liveTranslatedSourceTexts.count, valid < liveSegments.count,
+                  liveTranslatedSourceTexts[valid] == liveSegments[valid].text.trimmingCharacters(in: .whitespaces) {
+                valid += 1
+            }
+            if valid < liveTranslatedSegments.count {
+                liveTranslatedSegments.removeSubrange(valid...)
+                liveTranslatedSourceTexts.removeSubrange(valid...)
+            }
         }
         liveSealedSegmentCount = publication.sealedCount
     }
@@ -691,6 +796,7 @@ class AppState {
         liveTranscriptionTask?.cancel()
         liveTranscriptionTask = nil
         invalidateTranslationWorker()
+        service.unloadLiveModel()
         liveRecorder = nil
         finishRequested = false
         translationFailureCount = 0
@@ -821,6 +927,9 @@ class AppState {
         translationEpoch &+= 1
         liveTranslationTask?.cancel()
         liveTranslationTask = nil
+        lastInterimTranslation = .distantPast
+        lastInterimTexts = []
+        lastInterimStart = -1
     }
 
     private func translationWorkerIsCurrent(_ epoch: UInt64) -> Bool {
@@ -828,11 +937,11 @@ class AppState {
             enableLiveTranslation && !liveTranslationPaused && !translationAuthPaused
     }
 
-    /// Translate only the immutable ASR prefix, with a monotonic cursor and one bounded
-    /// request in flight. No retained cumulative history snapshot or O(n) dirty scan.
+    /// Immutable batches advance a monotonic cursor; interim batches only replace
+    /// the bounded mutable tail. Both share one worker and the same retry budget.
     private func enqueueLiveTranslation() {
         guard liveTranslationTask == nil, translationWorkerIsCurrent(translationEpoch),
-              translationNextIndex < liveSealedSegmentCount else { return }
+              translationNextIndex < liveSegments.count else { return }
         let epoch = translationEpoch
         liveTranslationTask = Task { [weak self] in
             await self?.drainTranslationQueue(epoch: epoch)
@@ -844,7 +953,7 @@ class AppState {
             // An old canceled worker must not clear the handle of its replacement.
             if epoch == translationEpoch { liveTranslationTask = nil }
         }
-        while translationWorkerIsCurrent(epoch), translationNextIndex < liveSealedSegmentCount {
+        while translationWorkerIsCurrent(epoch), translationNextIndex < liveSegments.count {
             if translationFailureCount > 0 {
                 let milliseconds = Self.translationRetryDelayMilliseconds(failureCount: translationFailureCount)
                 try? await Task.sleep(for: .milliseconds(milliseconds))
@@ -859,17 +968,31 @@ class AppState {
             }
             liveTranslationLanguage = target
 
-            while translationNextIndex < liveSealedSegmentCount,
+            while translationNextIndex < liveSegments.count,
                   liveSegments[translationNextIndex].start < translationResumeTime {
+                guard translationNextIndex < liveSealedSegmentCount else { return }
                 nextTextDirtyFrom = translationNextIndex
-                liveTranslatedSegments.append("")
-                liveTranslatedSourceTexts.append(liveSegments[translationNextIndex].text)
+                liveTranslatedSegments.replaceSubrange(translationNextIndex..<liveTranslatedSegments.count, with: [""])
+                liveTranslatedSourceTexts.replaceSubrange(translationNextIndex..<liveTranslatedSourceTexts.count,
+                    with: [liveSegments[translationNextIndex].text.trimmingCharacters(in: .whitespaces)])
                 translationNextIndex += 1
             }
             let start = translationNextIndex
-            let end = min(start + 24, liveSealedSegmentCount)
+            let interim = start >= liveSealedSegmentCount
+            let end = min(start + 24, interim ? liveSegments.count : liveSealedSegmentCount)
             guard end > start else { return }
             let texts = liveSegments[start..<end].map { $0.text.trimmingCharacters(in: .whitespaces) }
+            if interim {
+                if translationFailureCount > 0 {
+                    let remaining = Self.interimTranslationInterval - Date().timeIntervalSince(lastInterimTranslation)
+                    if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
+                    guard translationWorkerIsCurrent(epoch) else { return }
+                }
+                guard !finishRequested,
+                      Date().timeIntervalSince(lastInterimTranslation) >= Self.interimTranslationInterval,
+                      start != lastInterimStart || texts != lastInterimTexts else { return }
+                lastInterimTranslation = Date()
+            }
             let context: [(original: String, translated: String)] = (max(0, start - 2)..<start).compactMap { i in
                 guard i < liveTranslatedSegments.count, !liveTranslatedSegments[i].isEmpty else { return nil }
                 return (liveTranslatedSourceTexts[i], liveTranslatedSegments[i])
@@ -887,12 +1010,17 @@ class AppState {
                     throw NSError(domain: "LiveTranslation", code: 1,
                         userInfo: [NSLocalizedDescriptionKey: "Translation returned an unexpected segment count."])
                 }
-                guard end <= liveSealedSegmentCount,
+                guard end <= liveSegments.count,
                       liveSegments[start..<end].map({ $0.text.trimmingCharacters(in: .whitespaces) }) == texts else { return }
                 nextTextDirtyFrom = start
-                liveTranslatedSegments.append(contentsOf: translated)
-                liveTranslatedSourceTexts.append(contentsOf: texts)
-                translationNextIndex = end
+                liveTranslatedSegments.replaceSubrange(start..<liveTranslatedSegments.count, with: translated)
+                liveTranslatedSourceTexts.replaceSubrange(start..<liveTranslatedSourceTexts.count, with: texts)
+                if interim {
+                    lastInterimStart = start
+                    lastInterimTexts = texts
+                } else {
+                    translationNextIndex = end
+                }
                 translationFailureCount = 0
                 liveTranslationError = nil
                 if isLiveTranscribing {

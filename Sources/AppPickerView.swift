@@ -7,6 +7,7 @@ struct AppPickerView: View {
     @Environment(\.dismiss) var dismiss
     @Environment(\.openWindow) var openWindow
     @State private var searchText = ""
+    @State private var modelManager = ModelManager.shared
     @AppStorage("liveTranslationPref") private var liveTranslationPref = false
 
     var body: some View {
@@ -37,6 +38,7 @@ struct AppPickerView: View {
                 recorder.loadAvailableApps()
             }
             appState.enableLiveTranslation = liveTranslationPref
+            modelManager.refresh()
         }
     }
 
@@ -122,6 +124,30 @@ struct AppPickerView: View {
             .toggleStyle(.checkbox)
             .padding(.horizontal, 12)
             .padding(.top, 8)
+
+            if appState.enableLiveTranscription {
+                HStack(spacing: 6) {
+                    Text("Live model:")
+                        .foregroundStyle(.secondary)
+                    Picker("Live transcription model", selection: Binding(
+                        get: { modelManager.liveFileName },
+                        set: { modelManager.liveFileName = $0 }
+                    )) {
+                        Text("Same as transcription model").tag("")
+                        ForEach(modelManager.downloadedModels) { model in
+                            Text(model.displayName).tag(model.fileName)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    Spacer()
+                }
+                .font(.caption)
+                .controlSize(.small)
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+                .help("A smaller, faster model keeps up with live audio; the final transcription of the recording still uses the main model")
+            }
 
             HStack {
                 Button("Cancel") {

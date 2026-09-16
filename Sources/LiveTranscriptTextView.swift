@@ -35,7 +35,8 @@ struct LiveTranscriptTextView: NSViewRepresentable {
         text.autoresizingMask = [.width]
         text.minSize = NSSize(width: 0, height: 0)
         text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        text.textContainerInset = NSSize(width: 12, height: 8)
+        // Match upstream's tail clearance without reintroducing a per-row List.
+        text.textContainerInset = NSSize(width: 12, height: 28)
         text.textContainer?.widthTracksTextView = true
         text.textContainer?.containerSize = NSSize(width: scroll.contentSize.width, height: .greatestFiniteMagnitude)
         text.layoutManager?.allowsNonContiguousLayout = true

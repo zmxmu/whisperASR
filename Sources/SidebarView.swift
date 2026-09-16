@@ -392,6 +392,16 @@ struct ModelPickerMenu: View {
                 }
             }
             .pickerStyle(.inline)
+            Picker("Live Transcription Model", selection: Binding(
+                get: { manager.liveFileName },
+                set: { manager.liveFileName = $0 }
+            )) {
+                Text("Same as Transcription Model").tag("")
+                ForEach(manager.downloadedModels) { model in
+                    Text(model.displayName).tag(model.fileName)
+                }
+            }
+            .pickerStyle(.inline)
             Divider()
             SettingsLink {
                 Text("Manage Models...")

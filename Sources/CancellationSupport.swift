@@ -219,6 +219,35 @@ final class CancellableTranscriptionQueue: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
     }
 
+    /// Cleanup shares the physical executor, never running alongside native inference.
+    func scheduleCleanup(_ operation: @escaping @Sendable () -> Void) {
+        queue.async { [self] in
+            guard !state.withLock({ $0.stopped }) else { return }
+            operation()
+        }
+    }
+
+    /// Bridge an async engine while retaining the physical serial slot after a
+    /// caller times out. The wait occupies this dedicated queue, never the UI or
+    /// Swift cooperative executor; no polling or CPU spin is involved.
+    func performAsync<Output: Sendable>(timeoutSeconds: TimeInterval,
+        operation: @escaping @Sendable (TranscriptionCancellation) async throws -> Output
+    ) async throws -> Output {
+        try await perform(timeoutSeconds: timeoutSeconds) { cancellation in
+            let completion = DispatchSemaphore(value: 0)
+            let result = OSAllocatedUnfairLock<Result<Output, Error>?>(initialState: nil)
+            Task.detached {
+                let value: Result<Output, Error>
+                do { value = .success(try await operation(cancellation)) }
+                catch { value = .failure(error) }
+                result.withLock { $0 = value }
+                completion.signal()
+            }
+            completion.wait()
+            return try result.withLock { $0! }.get()
+        }
+    }
+
     /// Close admission and cancel callers without waiting on the serial worker.
     /// The service's process-exit path deliberately leaves its C context allocated:
     /// a stuck GPU kernel cannot be safely interrupted or force-freed here.

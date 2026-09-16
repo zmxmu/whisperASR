@@ -4,9 +4,12 @@ import UniformTypeIdentifiers
 struct DetailView: View {
     @Environment(AppState.self) var appState
     @Environment(AudioPlayerManager.self) var audioPlayer
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
     @State private var showTimestamps = true
     @State private var translationOnly = false
     @State private var showSearch = false
+    @State private var minutesPromptStore = MinutesPromptStore.shared
 
     var body: some View {
         Group {
@@ -117,6 +120,31 @@ struct DetailView: View {
                             .help(showTimestamps ? "Hide timestamps" : "Show timestamps")
 
                             Menu {
+                                ForEach(minutesPromptStore.prompts) { prompt in
+                                    Button {
+                                        generateMinutes(item, prompt: prompt)
+                                    } label: {
+                                        HStack {
+                                            Text(prompt.name)
+                                            if minutesPromptStore.selectedPromptID == prompt.id {
+                                                Spacer()
+                                                Image(systemName: "checkmark")
+                                            }
+                                        }
+                                    }
+                                }
+                                Divider()
+                                if hasGeneratedMinutes(for: item) {
+                                    Button("Show Minutes") { openWindow(id: "minutes") }
+                                }
+                                Button("Edit Prompts…") { openSettings() }
+                            } label: {
+                                Label("Meeting Minutes", systemImage: "list.bullet.clipboard")
+                            }
+                            .menuIndicator(.hidden)
+                            .help("Generate meeting minutes with a prompt")
+
+                            Menu {
                                 Button("Copy Content") { copyContent(item) }
                                 if !item.translatedSegments.isEmpty {
                                     Button("Copy Translation") { copyTranslation(item) }
@@ -125,6 +153,13 @@ struct DetailView: View {
                                 Button("Export Text...") { exportText(item) }
                                 if !item.translatedSegments.isEmpty {
                                     Button("Export Translation...") { exportTranslation(item) }
+                                }
+                                if !item.segments.isEmpty {
+                                    Menu("Export Subtitles") {
+                                        ForEach(SubtitleFormat.allCases) { format in
+                                            Button("\(format.displayName)...") { exportSubtitles(item, format: format) }
+                                        }
+                                    }
                                 }
                             } label: {
                                 Label("Export", systemImage: "square.and.arrow.up")
@@ -175,12 +210,23 @@ struct DetailView: View {
         }
     }
 
+    // MARK: - Meeting Minutes
+
+    private func generateMinutes(_ item: TranscriptionItem, prompt: MinutesPrompt) {
+        minutesPromptStore.selectedPromptID = prompt.id
+        MinutesGenerator.shared.generate(item: item, prompt: prompt)
+        openWindow(id: "minutes")
+    }
+
+    private func hasGeneratedMinutes(for item: TranscriptionItem) -> Bool {
+        let generator = MinutesGenerator.shared
+        return generator.sourceItemID == item.id && generator.phase == .completed
+    }
+
     // MARK: - Copy & Export
 
     private func copyContent(_ item: TranscriptionItem) {
-        let text = item.segments.isEmpty
-            ? item.fullText
-            : item.segments.map { $0.text.trimmingCharacters(in: .whitespaces) }.joined(separator: "\n")
+        let text = plainTranscript(item)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
@@ -200,10 +246,30 @@ struct DetailView: View {
 
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            let text = item.segments.isEmpty
-                ? item.fullText
-                : item.segments.map { $0.text.trimmingCharacters(in: .whitespaces) }.joined(separator: "\n")
+            let text = plainTranscript(item)
             try? text.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// One line per segment, prefixed with the speaker once the transcript has
+    /// been diarized. Shared by Copy and Export so both put out the same text.
+    private func plainTranscript(_ item: TranscriptionItem) -> String {
+        guard !item.segments.isEmpty else { return item.fullText }
+        return item.segments.map { SubtitleFormatter.speakerLine($0) }.joined(separator: "\n")
+    }
+
+    private func exportSubtitles(_ item: TranscriptionItem, format: SubtitleFormat) {
+        let baseName = (item.fileName as NSString).deletingPathExtension
+        let panel = NSSavePanel()
+        if let type = UTType(filenameExtension: format.fileExtension) {
+            panel.allowedContentTypes = [type]
+        }
+        panel.nameFieldStringValue = baseName + "." + format.fileExtension
+
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            let content = SubtitleFormatter.make(format, segments: item.segments, title: baseName)
+            try? content.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 
@@ -273,6 +339,7 @@ struct TranscribingView: View {
 
 struct TranscriptContentView: View {
     let item: TranscriptionItem
+    @Environment(AppState.self) var appState
     @Environment(AudioPlayerManager.self) var audioPlayer
     @State private var currentIndex: Int?
     @Binding var showSearch: Bool
@@ -290,6 +357,13 @@ struct TranscriptContentView: View {
         VStack(spacing: 0) {
             if showSearch {
                 searchBar
+            }
+            // The speaker panel belongs to the transcript itself, so it is hidden
+            // in the translation-only pane.
+            if !translationOnly, !item.segments.isEmpty {
+                SpeakerSummaryView(item: item)
+                    .padding(.horizontal)
+                    .padding(.top, 8)
             }
             transcriptScrollView
         }
@@ -518,6 +592,20 @@ struct SegmentRow: View {
             }
 
             VStack(alignment: .leading, spacing: 2) {
+                if !translationOnly, let speaker = segment.speakerDisplayName, !speaker.isEmpty {
+                    HStack(spacing: 5) {
+                        if let colorHex = segment.speakerColor,
+                           let nsColor = NSColor(hexString: colorHex) {
+                            Circle()
+                                .fill(Color(nsColor: nsColor))
+                                .frame(width: 8, height: 8)
+                        }
+                        Text(speaker)
+                            .font(.system(.caption, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if !translationOnly {
                     highlightedText(segment.text.trimmingCharacters(in: .whitespaces))
                         .font(fontSize.bodyFont)

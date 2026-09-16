@@ -5,6 +5,26 @@ import os
 final class TranscriptionService: @unchecked Sendable {
     private var ctx: OpaquePointer?
     private var loadedModelPath: String?
+    private var liveCtx: OpaquePointer?
+    private var loadedLiveModelPath: String?
+    private let nemotron = NemotronEngine()
+    private let nemotronQueue = CancellableTranscriptionQueue(label: "com.whisperasr.nemotron")
+    private let liveStateLock = NSLock()
+    private var liveNemotronActive = false
+    private enum ResolvedEngine {
+        case whisper(path: String)
+        case nemotron(directory: String)
+    }
+    private func resolveEngine() -> ResolvedEngine { Self.engine(forPath: resolveModelPath()) }
+    private func resolveLiveEngine() -> ResolvedEngine { Self.engine(forPath: resolveLiveModelPath()) }
+    private static func engine(forPath path: String) -> ResolvedEngine {
+        var directory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: path, isDirectory: &directory), directory.boolValue {
+            return .nemotron(directory: path)
+        }
+        return .whisper(path: path)
+    }
+    var liveModelDiffers: Bool { resolveLiveModelPath() != resolveModelPath() }
     private let processExitRequested = OSAllocatedUnfairLock(initialState: false)
     private let fileRequestsInFlight = OSAllocatedUnfairLock(initialState: 0)
     /// Serial queue to ensure only one whisper_full() runs at a time (ctx is not thread-safe).
@@ -14,6 +34,7 @@ final class TranscriptionService: @unchecked Sendable {
         // A running worker retains self. Outside process termination, deinit can
         // therefore only release ctx after the last physical C operation returns.
         if !processExitRequested.withLock({ $0 }), let ctx { whisper_free(ctx) }
+        if !processExitRequested.withLock({ $0 }), let liveCtx { whisper_free(liveCtx) }
     }
 
     func shutdown() {
@@ -22,6 +43,32 @@ final class TranscriptionService: @unchecked Sendable {
         // the context alive for process reclamation; this is NOT a model-unload API.
         processExitRequested.withLock { $0 = true }
         whisperQueue.shutdown()
+        nemotronQueue.shutdown()
+    }
+
+    /// Free the live session's resources when recording ends: the dedicated
+    /// live whisper context (if any), and the Nemotron engine when only the
+    /// live selection was using it.
+    func unloadLiveModel() {
+        let wasNemotron = liveStateLock.withLock {
+            let was = liveNemotronActive
+            liveNemotronActive = false
+            return was
+        }
+
+        whisperQueue.scheduleCleanup {
+            if let liveCtx = self.liveCtx {
+                whisper_free(liveCtx)
+                self.liveCtx = nil
+                self.loadedLiveModelPath = nil
+            }
+        }
+        if wasNemotron, case .whisper = resolveEngine() {
+            Task { try? await self.nemotronQueue.performAsync(timeoutSeconds: 60) { cancellation in
+                try cancellation.checkCancellation()
+                await self.nemotron.unload()
+            } }
+        }
     }
 
     /// Transcribe (or translate-to-English, when `translate` is true) an audio file.
@@ -40,9 +87,39 @@ final class TranscriptionService: @unchecked Sendable {
         }
         guard admitted else { throw TranscriptionExecutionError.busy }
         defer { fileRequestsInFlight.withLock { $0 -= 1 } }
-        try whisperQueue.checkAvailability()
+        let engine = resolveEngine()
+        switch engine {
+        case .whisper: try whisperQueue.checkAvailability()
+        case .nemotron: try nemotronQueue.checkAvailability()
+        }
         let samples = try await AudioLoader.loadSamples(url: fileURL)
         try Task.checkCancellation()
+        if case .nemotron(let directory) = engine {
+            guard !translate else {
+                throw TranscriptionError.processFailed("Translation to English requires a Whisper model.")
+            }
+            whisperQueue.scheduleCleanup {
+                if let ctx = self.ctx { whisper_free(ctx) }
+                self.ctx = nil
+                self.loadedModelPath = nil
+            }
+            return try await nemotronQueue.performAsync(timeoutSeconds: max(60, Double(samples.count) / 16000 * 4)) { cancellation in
+                try cancellation.checkCancellation()
+                try await self.nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory))
+                return try await self.nemotron.transcribe(samples: samples, language: language,
+                    onProgress: onProgress, cancellation: cancellation)
+            }
+        }
+        if !liveStateLock.withLock({ liveNemotronActive }) {
+            // Keep disposal serialized with Core ML operations as well: an actor
+            // alone can re-enter during load/process awaits.
+            Task { try? await self.nemotronQueue.performAsync(timeoutSeconds: 60) { cancellation in
+                try cancellation.checkCancellation()
+                if !self.liveStateLock.withLock({ self.liveNemotronActive }) {
+                    await self.nemotron.unload()
+                }
+            } }
+        }
         return try await whisperQueue.perform(timeoutSeconds: max(60, Double(samples.count) / 16000 * 4)) { cancellation in
             try self.runTranscription(samples: samples, language: language,
                                       translate: translate, threadCount: nil,
@@ -62,11 +139,19 @@ final class TranscriptionService: @unchecked Sendable {
         }
 
         let timeout = timeoutSeconds ?? max(60, Double(samples.count) / 16000 * 4)
+        if case .nemotron(let directory) = resolveLiveEngine() {
+            return try await nemotronQueue.performAsync(timeoutSeconds: timeout) { cancellation in
+                try cancellation.checkCancellation()
+                try await self.nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory))
+                return try await self.nemotron.transcribe(samples: samples, language: language,
+                    cancellation: cancellation)
+            }
+        }
         return try await whisperQueue.perform(timeoutSeconds: timeout) { cancellation in
             let liveThreads = min(4, max(1, Int32(ProcessInfo.processInfo.activeProcessorCount / 4)))
             return try self.runTranscription(samples: samples, language: language,
                                             translate: false, threadCount: liveThreads,
-                                            cancellation: cancellation, onProgress: nil)
+                                            cancellation: cancellation, onProgress: nil, live: true)
         }
     }
 
@@ -74,18 +159,27 @@ final class TranscriptionService: @unchecked Sendable {
     /// Cancellation/timeout resumes the caller even if model loading cannot be interrupted.
     /// The model operation still owns the serial slot until its C call really returns.
     func preloadModel() async throws {
+        if case .nemotron(let directory) = resolveLiveEngine() {
+            liveStateLock.withLock { liveNemotronActive = true }
+            try await nemotronQueue.performAsync(timeoutSeconds: 60) { cancellation in
+                try cancellation.checkCancellation()
+                try await self.nemotron.ensureLoaded(directory: URL(fileURLWithPath: directory))
+            }
+            return
+        }
+        liveStateLock.withLock { liveNemotronActive = false }
         try await whisperQueue.perform(timeoutSeconds: 60) { cancellation in
             try cancellation.checkCancellation()
-            _ = try self.ensureModelLoaded()
+            _ = try self.ensureLiveModelLoaded()
             try cancellation.checkCancellation()
         }
     }
 
     private func runTranscription(samples: [Float], language: String?, translate: Bool,
                                   threadCount: Int32?, cancellation: TranscriptionCancellation,
-                                  onProgress: (@Sendable (Double) -> Void)?) throws -> TranscriptionResult {
+                                  onProgress: (@Sendable (Double) -> Void)?, live: Bool = false) throws -> TranscriptionResult {
         try cancellation.checkCancellation()
-        let ctx = try ensureModelLoaded()
+        let ctx = try live ? ensureLiveModelLoaded() : ensureModelLoaded()
         try cancellation.checkCancellation()
         try validateLanguage(language, for: ctx)
 
@@ -219,6 +313,9 @@ final class TranscriptionService: @unchecked Sendable {
            files.contains(where: { $0.hasSuffix(".bin") }) {
             return true
         }
+        if ModelCatalog.all.contains(where: { $0.engine == .nemotron && ModelCatalog.isComplete($0) }) {
+            return true
+        }
         if let custom = UserDefaults.standard.string(forKey: "modelPath"),
            !custom.isEmpty,
            FileManager.default.fileExists(atPath: custom) {
@@ -251,19 +348,56 @@ final class TranscriptionService: @unchecked Sendable {
             if let ctx { whisper_free(ctx) }
             ctx = nil
             loadedModelPath = nil
-
-            var cparams = whisper_context_default_params()
-            cparams.use_gpu = true  // Metal GPU acceleration
-            cparams.flash_attn = true
-
-            ctx = path.withCString { whisper_init_from_file_with_params($0, cparams) }
-            guard ctx != nil else {
-                throw TranscriptionError.processFailed("Failed to load whisper model from: \(path)")
-            }
+            ctx = try Self.loadContext(path: path)
             loadedModelPath = path
         }
         guard let ctx else {
             throw TranscriptionError.processFailed("Model not loaded")
+        }
+        return ctx
+    }
+
+    /// Live-model counterpart of `ensureModelLoaded()`. When the live selection
+    /// resolves to the same file as the main model, the main context is shared
+    /// instead of loading the same weights twice. MUST run on `whisperQueue`.
+    private func ensureLiveModelLoaded() throws -> OpaquePointer {
+        whisperQueue.assertOnQueue()
+        let livePath = resolveLiveModelPath()
+        if livePath == resolveModelPath() {
+            // Drop a stale dedicated context (live selection changed mid-session).
+            if let liveCtx {
+                whisper_free(liveCtx)
+                self.liveCtx = nil
+                loadedLiveModelPath = nil
+            }
+            return try ensureModelLoaded()
+        }
+        guard FileManager.default.fileExists(atPath: livePath) else {
+            throw TranscriptionError.modelNotFound(
+                "Live transcription model not found at: \(livePath)\n\n" +
+                "Download a model in Settings → Speech Recognition Models."
+            )
+        }
+        if loadedLiveModelPath != livePath {
+            if let liveCtx { whisper_free(liveCtx) }
+            liveCtx = nil
+            loadedLiveModelPath = nil
+            liveCtx = try Self.loadContext(path: livePath)
+            loadedLiveModelPath = livePath
+        }
+        guard let liveCtx else {
+            throw TranscriptionError.processFailed("Model not loaded")
+        }
+        return liveCtx
+    }
+
+    private static func loadContext(path: String) throws -> OpaquePointer {
+        var cparams = whisper_context_default_params()
+        cparams.use_gpu = true  // Metal GPU acceleration
+        cparams.flash_attn = true
+
+        guard let ctx = path.withCString({ whisper_init_from_file_with_params($0, cparams) }) else {
+            throw TranscriptionError.processFailed("Failed to load whisper model from: \(path)")
         }
         return ctx
     }
@@ -293,6 +427,20 @@ final class TranscriptionService: @unchecked Sendable {
         // Fallback to project-relative path (development)
         let projectRoot = resolveProjectRoot()
         return (projectRoot as NSString).appendingPathComponent("Models/ggml-model.bin")
+    }
+
+    /// Model used for live transcription during recording: the dedicated live
+    /// selection (usually a smaller, faster model) when set and present,
+    /// otherwise whatever the main resolution picks.
+    private func resolveLiveModelPath() -> String {
+        if let live = UserDefaults.standard.string(forKey: "liveModelFile"),
+           !live.isEmpty {
+            let livePath = ModelCatalog.modelDirectory.appendingPathComponent(live).path
+            if FileManager.default.fileExists(atPath: livePath) {
+                return livePath
+            }
+        }
+        return resolveModelPath()
     }
 
     private func resolveProjectRoot() -> String {

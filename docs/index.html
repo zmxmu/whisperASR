@@ -4,13 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>WhisperASR — Live Transcription & Translation for Mac</title>
-  <meta name="description" content="Native macOS app that transcribes and translates audio in real time using whisper.cpp and Metal GPU. Choose from six downloadable speech models. Fully on-device, privacy-first." />
+  <meta name="description" content="Native macOS app that transcribes and translates audio in real time using whisper.cpp and Metal GPU, and turns transcripts into meeting minutes in one click. Choose from seven downloadable speech models. Fully on-device, privacy-first." />
 
   <!-- Open Graph -->
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://plateaukao.github.io/whisperASR/" />
   <meta property="og:title" content="WhisperASR — Live Transcription & Translation for Mac" />
-  <meta property="og:description" content="Real-time transcription and translation of any app's audio. Powered by whisper.cpp on Metal GPU. Fully on-device, privacy-first." />
+  <meta property="og:description" content="Real-time transcription and translation of any app's audio, plus one-click meeting minutes. Powered by whisper.cpp on Metal GPU. Fully on-device, privacy-first." />
   <meta property="og:image" content="https://plateaukao.github.io/whisperASR/screenshots/og-image.png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
@@ -18,7 +18,7 @@
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="WhisperASR — Live Transcription & Translation for Mac" />
-  <meta name="twitter:description" content="Real-time transcription and translation of any app's audio. Powered by whisper.cpp on Metal GPU. Fully on-device, privacy-first." />
+  <meta name="twitter:description" content="Real-time transcription and translation of any app's audio, plus one-click meeting minutes. Powered by whisper.cpp on Metal GPU. Fully on-device, privacy-first." />
   <meta name="twitter:image" content="https://plateaukao.github.io/whisperASR/screenshots/og-image.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -90,6 +90,15 @@
       padding: 7px 16px !important; border-radius: 7px !important; font-weight: 600 !important;
     }
     .nav-gh:hover { opacity: .85 !important; }
+
+    .lang-btn {
+      font-family: var(--b); font-size: 12px; font-weight: 600;
+      background: transparent; color: var(--text2);
+      border: 1px solid var(--border); border-radius: 7px;
+      padding: 5px 12px; cursor: pointer;
+      transition: color .2s, border-color .2s;
+    }
+    .lang-btn:hover { color: var(--teal); border-color: var(--teal); }
 
     /* HERO — side by side */
     .hero {
@@ -295,7 +304,7 @@
       .feat-card.featured .feat-ss { }
       .privacy-inner { grid-template-columns: 1fr 1fr; }
       .privacy-heading { grid-column: span 2; border-right: none; padding-right: 0; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
-      nav ul li:not(:last-child) { display: none; }
+      nav ul li:not(:nth-last-child(-n+2)) { display: none; }
       nav { padding: 0 20px; }
       .features, .privacy { padding: 40px 20px; }
       footer { flex-direction: column; gap: 8px; text-align: center; }
@@ -307,8 +316,9 @@
   <nav>
     <a href="#" class="logo">Whisper<span>ASR</span></a>
     <ul>
-      <li><a href="#features">Features</a></li>
-      <li><a href="#privacy">Privacy</a></li>
+      <li><a href="#features" data-i18n="nav_features">Features</a></li>
+      <li><a href="#privacy" data-i18n="nav_privacy">Privacy</a></li>
+      <li><button type="button" class="lang-btn" id="lang-toggle" aria-label="Switch language">中文</button></li>
       <li><a href="https://github.com/plateaukao/whisperASR" class="nav-gh">GitHub</a></li>
     </ul>
   </nav>
@@ -316,29 +326,30 @@
   <!-- HERO -->
   <section class="hero">
     <div class="hero-text">
-      <div class="eyebrow"><span class="dot"></span> Live transcription &amp; translation</div>
-      <h1>Transcribe any audio.<br /><em>Translate it instantly.</em></h1>
-      <p class="hero-desc">
+      <div class="eyebrow"><span class="dot"></span> <span data-i18n="eyebrow">Live transcription &amp; translation</span></div>
+      <h1 data-i18n="hero_title">Transcribe any audio.<br /><em>Translate it instantly.</em></h1>
+      <p class="hero-desc" data-i18n="hero_desc">
         Real-time transcription and translation of any app's audio —
         powered by whisper.cpp on your Mac's Metal GPU.
         Completely private, fully on-device.
+        And when the meeting ends, one click turns the transcript into meeting minutes.
       </p>
       <div class="hero-actions">
-        <a href="https://github.com/plateaukao/whisperASR/releases/download/v0.5/WhisperASR.zip" class="btn btn-solid">
+        <a href="https://github.com/plateaukao/whisperASR/releases/latest/download/WhisperASR.zip" class="btn btn-solid">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          Download v0.5
+          <span data-i18n="btn_download">Download v0.8.0</span>
         </a>
         <a href="https://github.com/plateaukao/whisperASR" class="btn btn-outline">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
         </a>
-        <a href="#features" class="btn btn-outline">See features ↓</a>
+        <a href="#features" class="btn btn-outline" data-i18n="btn_features">See features ↓</a>
       </div>
-      <p class="hero-meta">macOS 14+ · Apple Silicon · Free &amp; Open Source</p>
+      <p class="hero-meta" data-i18n="hero_meta">macOS 14+ · Apple Silicon · Free &amp; Open Source</p>
     </div>
 
     <div class="hero-ss">
-      <div class="live-pill"><span class="dot"></span> Recording</div>
+      <div class="live-pill"><span class="dot"></span> <span data-i18n="pill_recording">Recording</span></div>
       <img src="screenshots/live_recording.png" alt="WhisperASR live transcription" />
     </div>
   </section>
@@ -346,19 +357,19 @@
   <!-- FEATURES -->
   <section class="features" id="features">
     <div class="features-inner">
-      <p class="section-label reveal">Features</p>
+      <p class="section-label reveal" data-i18n="features_label">Features</p>
       <div class="feat-grid">
 
         <!-- Featured: Live transcription -->
         <div class="feat-card featured reveal">
           <div class="feat-body">
             <div class="feat-icon">🎙</div>
-            <h3>Live transcription<br /><em>+ translation</em></h3>
-            <p>Record any app's audio system-wide — Zoom, YouTube, podcasts — and watch the transcript appear word by word with simultaneous translation flowing alongside it.</p>
+            <h3 data-i18n="f_live_h">Live transcription<br /><em>+ translation</em></h3>
+            <p data-i18n="f_live_p">Record any app's audio system-wide — Zoom, YouTube, podcasts — and watch the transcript appear word by word with simultaneous translation flowing alongside it.</p>
             <div class="feat-pills">
-              <div class="pill">Pick any app to record</div>
-              <div class="pill">Word-by-word live output</div>
-              <div class="pill">Translate as you listen</div>
+              <div class="pill" data-i18n="f_live_p1">Pick any app to record</div>
+              <div class="pill" data-i18n="f_live_p2">Word-by-word live output</div>
+              <div class="pill" data-i18n="f_live_p3">Translate as you listen</div>
             </div>
           </div>
           <div class="feat-ss">
@@ -370,8 +381,8 @@
         <div class="feat-card reveal d1">
           <div class="feat-body">
             <div class="feat-icon">🗂</div>
-            <h3>File<br /><em>transcription</em></h3>
-            <p>Drag &amp; drop any audio or video file. WhisperASR transcribes it with a live progress bar and time estimate. MP3, M4A, MP4, MOV and more.</p>
+            <h3 data-i18n="f_file_h">File<br /><em>transcription</em></h3>
+            <p data-i18n="f_file_p">Drag &amp; drop any audio or video file. WhisperASR transcribes it with a live progress bar and time estimate. MP3, M4A, MP4, MOV and more.</p>
           </div>
           <div class="feat-ss">
             <img src="screenshots/progress.png" alt="File transcription in progress" />
@@ -382,11 +393,28 @@
         <div class="feat-card reveal d2">
           <div class="feat-body">
             <div class="feat-icon">🌐</div>
-            <h3>Bilingual<br /><em>output</em></h3>
-            <p>Every segment shows the original transcript alongside your translation in teal. Export the transcript to a text file when done.</p>
+            <h3 data-i18n="f_bi_h">Bilingual<br /><em>output</em></h3>
+            <p data-i18n="f_bi_p">Every segment shows the original transcript alongside your translation in teal. Export the transcript to a text file when done.</p>
           </div>
           <div class="feat-ss">
             <img src="screenshots/transcript.png" alt="Bilingual transcript" />
+          </div>
+        </div>
+
+        <!-- Featured: Meeting minutes -->
+        <div class="feat-card featured reveal">
+          <div class="feat-body">
+            <div class="feat-icon">📋</div>
+            <h3 data-i18n="f_min_h">Meeting minutes<br /><em>in one click</em></h3>
+            <p data-i18n="f_min_p">Pick a prompt from the transcript toolbar and WhisperASR turns the whole transcript into structured minutes — summary, decisions, action items — rendered as clean HTML. Copy them fully formatted into Mail, Word or Google Docs, or export as a file.</p>
+            <div class="feat-pills">
+              <div class="pill" data-i18n="f_min_p1">Custom prompt templates for different meetings</div>
+              <div class="pill" data-i18n="f_min_p2">Long recordings are chunked and summarized automatically</div>
+              <div class="pill" data-i18n="f_min_p3">Copy as rich text or export HTML</div>
+            </div>
+          </div>
+          <div class="feat-ss">
+            <img src="screenshots/minutes.png" alt="Generated meeting minutes with summary, decisions and action items" />
           </div>
         </div>
 
@@ -397,12 +425,12 @@
           </div>
           <div class="feat-body">
             <div class="feat-icon">🧠</div>
-            <h3>Pick the model<br /><em>that fits</em></h3>
-            <p>Download any of six speech recognition models right in the app — from the 78 MB Whisper Tiny to Breeze-ASR-25, tuned for Mandarin and Taiwanese-accented speech — and switch between them anytime.</p>
+            <h3 data-i18n="f_model_h">Pick the model<br /><em>that fits</em></h3>
+            <p data-i18n="f_model_p">Download any of seven speech recognition models right in the app — from the 78 MB Whisper Tiny to Breeze-ASR-25, tuned for Mandarin and Taiwanese-accented speech — and switch between them anytime.</p>
             <div class="feat-pills">
-              <div class="pill">One-click download, resumable</div>
-              <div class="pill">Switch models from the toolbar</div>
-              <div class="pill">Trade accuracy for speed when you need it</div>
+              <div class="pill" data-i18n="f_model_p1">One-click download, resumable</div>
+              <div class="pill" data-i18n="f_model_p2">Switch models from the toolbar</div>
+              <div class="pill" data-i18n="f_model_p3">Trade accuracy for speed when you need it</div>
             </div>
           </div>
         </div>
@@ -414,35 +442,147 @@
   <!-- PRIVACY -->
   <section class="privacy" id="privacy">
     <div class="privacy-inner">
-      <div class="privacy-heading reveal">
+      <div class="privacy-heading reveal" data-i18n="priv_h">
         100% on&#8209;device.<br /><em>Nothing leaves<br />your Mac.</em>
       </div>
       <div class="priv-item reveal d1">
         <div class="priv-icon">🔒</div>
-        <h4>Fully local inference</h4>
-        <p>Whisper runs on-device via whisper.cpp. Your audio and transcripts never touch a server.</p>
+        <h4 data-i18n="priv1_h">Fully local inference</h4>
+        <p data-i18n="priv1_p">Whisper runs on-device via whisper.cpp. Your audio and transcripts never touch a server.</p>
       </div>
       <div class="priv-item reveal d2">
         <div class="priv-icon">⚡</div>
-        <h4>Metal GPU acceleration</h4>
-        <p>Leverages Apple's Metal framework for fast transcription on M-series chips.</p>
+        <h4 data-i18n="priv2_h">Metal GPU acceleration</h4>
+        <p data-i18n="priv2_p">Leverages Apple's Metal framework for fast transcription on M-series chips.</p>
       </div>
       <div class="priv-item reveal d3">
         <div class="priv-icon">🔌</div>
-        <h4>Bring your own API</h4>
-        <p>Translation uses any OpenAI-compatible endpoint — including local models.</p>
+        <h4 data-i18n="priv3_h">Bring your own API</h4>
+        <p data-i18n="priv3_p">Translation and meeting minutes use any OpenAI-compatible endpoint — including local models.</p>
       </div>
     </div>
   </section>
 
   <footer>
     <p>© 2026 WhisperASR · <a href="https://github.com/plateaukao/whisperASR">GitHub</a></p>
-    <p>Built with <a href="https://github.com/ggerganov/whisper.cpp" target="_blank">whisper.cpp</a> &amp; Apple Metal · macOS 14+</p>
+    <p data-i18n="footer_built">Built with <a href="https://github.com/ggerganov/whisper.cpp" target="_blank">whisper.cpp</a> &amp; Apple Metal · macOS 14+</p>
   </footer>
 
   <script>
     const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }), { threshold: 0.1 });
     document.querySelectorAll('.reveal').forEach(el => io.observe(el));
+
+    // --- Language toggle (EN / 繁體中文) ---
+    const I18N = {
+      en: {
+        _title: 'WhisperASR — Live Transcription & Translation for Mac',
+        nav_features: 'Features',
+        nav_privacy: 'Privacy',
+        eyebrow: 'Live transcription &amp; translation',
+        hero_title: 'Transcribe any audio.<br /><em>Translate it instantly.</em>',
+        hero_desc: "Real-time transcription and translation of any app's audio — powered by whisper.cpp on your Mac's Metal GPU. Completely private, fully on-device. And when the meeting ends, one click turns the transcript into meeting minutes.",
+        btn_download: 'Download v0.8.0',
+        btn_features: 'See features ↓',
+        hero_meta: 'macOS 14+ · Apple Silicon · Free &amp; Open Source',
+        pill_recording: 'Recording',
+        features_label: 'Features',
+        f_live_h: 'Live transcription<br /><em>+ translation</em>',
+        f_live_p: "Record any app's audio system-wide — Zoom, YouTube, podcasts — and watch the transcript appear word by word with simultaneous translation flowing alongside it.",
+        f_live_p1: 'Pick any app to record',
+        f_live_p2: 'Word-by-word live output',
+        f_live_p3: 'Translate as you listen',
+        f_file_h: 'File<br /><em>transcription</em>',
+        f_file_p: 'Drag &amp; drop any audio or video file. WhisperASR transcribes it with a live progress bar and time estimate. MP3, M4A, MP4, MOV and more.',
+        f_bi_h: 'Bilingual<br /><em>output</em>',
+        f_bi_p: 'Every segment shows the original transcript alongside your translation in teal. Export the transcript to a text file when done.',
+        f_min_h: 'Meeting minutes<br /><em>in one click</em>',
+        f_min_p: 'Pick a prompt from the transcript toolbar and WhisperASR turns the whole transcript into structured minutes — summary, decisions, action items — rendered as clean HTML. Copy them fully formatted into Mail, Word or Google Docs, or export as a file.',
+        f_min_p1: 'Custom prompt templates for different meetings',
+        f_min_p2: 'Long recordings are chunked and summarized automatically',
+        f_min_p3: 'Copy as rich text or export HTML',
+        f_model_h: 'Pick the model<br /><em>that fits</em>',
+        f_model_p: 'Download any of seven speech recognition models right in the app — from the 78 MB Whisper Tiny to Breeze-ASR-25, tuned for Mandarin and Taiwanese-accented speech — and switch between them anytime.',
+        f_model_p1: 'One-click download, resumable',
+        f_model_p2: 'Switch models from the toolbar',
+        f_model_p3: 'Trade accuracy for speed when you need it',
+        priv_h: '100% on&#8209;device.<br /><em>Nothing leaves<br />your Mac.</em>',
+        priv1_h: 'Fully local inference',
+        priv1_p: 'Whisper runs on-device via whisper.cpp. Your audio and transcripts never touch a server.',
+        priv2_h: 'Metal GPU acceleration',
+        priv2_p: "Leverages Apple's Metal framework for fast transcription on M-series chips.",
+        priv3_h: 'Bring your own API',
+        priv3_p: 'Translation and meeting minutes use any OpenAI-compatible endpoint — including local models.',
+        footer_built: 'Built with <a href="https://github.com/ggerganov/whisper.cpp" target="_blank">whisper.cpp</a> &amp; Apple Metal · macOS 14+'
+      },
+      zh: {
+        _title: 'WhisperASR — Mac 即時語音轉錄與翻譯',
+        nav_features: '功能',
+        nav_privacy: '隱私',
+        eyebrow: '即時轉錄與翻譯',
+        hero_title: '轉錄任何音訊。<br /><em>即時翻譯。</em>',
+        hero_desc: '即時轉錄並翻譯任何應用程式的聲音 — 由 whisper.cpp 驅動，在 Mac 的 Metal GPU 上運行。完全私密、全程在本機處理。會議結束後，一鍵把逐字稿變成會議記錄。',
+        btn_download: '下載 v0.8.0',
+        btn_features: '功能介紹 ↓',
+        hero_meta: 'macOS 14+ · Apple Silicon · 免費開源',
+        pill_recording: '錄製中',
+        features_label: '功能特色',
+        f_live_h: '即時轉錄<br /><em>+ 同步翻譯</em>',
+        f_live_p: '系統層級錄製任何應用程式的聲音 — Zoom、YouTube、Podcast — 看著逐字稿逐字浮現，翻譯同步顯示在旁。',
+        f_live_p1: '任選一個應用程式錄音',
+        f_live_p2: '逐字即時輸出',
+        f_live_p3: '邊聽邊翻譯',
+        f_file_h: '檔案<br /><em>轉錄</em>',
+        f_file_p: '拖放任何音訊或影片檔案，WhisperASR 會邊轉錄邊顯示進度與預估剩餘時間。支援 MP3、M4A、MP4、MOV 等格式。',
+        f_bi_h: '雙語<br /><em>對照</em>',
+        f_bi_p: '每個段落同時顯示原文與青色的譯文，完成後可將逐字稿匯出成文字檔。',
+        f_min_h: '一鍵生成<br /><em>會議記錄</em>',
+        f_min_p: '在逐字稿工具列選一個提示範本，WhisperASR 就把整份逐字稿整理成結構化會議記錄 — 摘要、決議、待辦事項 — 以乾淨的 HTML 呈現。可帶格式複製到郵件、Word 或 Google 文件，也可匯出成檔案。',
+        f_min_p1: '為不同會議自訂提示範本',
+        f_min_p2: '過長的錄音自動分段摘要',
+        f_min_p3: '複製為富文字，或匯出 HTML',
+        f_model_h: '挑一個<br /><em>合適的模型</em>',
+        f_model_p: '在應用程式內直接下載七種語音辨識模型 — 從 78 MB 的 Whisper Tiny 到專為華語與台灣口音調校的 Breeze-ASR-25 — 並可隨時切換。',
+        f_model_p1: '一鍵下載，支援續傳',
+        f_model_p2: '從工具列切換模型',
+        f_model_p3: '需要時用精度換速度',
+        priv_h: '100% 在本機運算。<br /><em>什麼都不會<br />離開你的 Mac。</em>',
+        priv1_h: '完全本機推論',
+        priv1_p: 'Whisper 透過 whisper.cpp 在本機執行，你的音訊與逐字稿不會經過任何伺服器。',
+        priv2_h: 'Metal GPU 加速',
+        priv2_p: '運用 Apple Metal 框架，在 M 系列晶片上快速轉錄。',
+        priv3_h: '自備 API',
+        priv3_p: '翻譯與會議記錄可使用任何 OpenAI 相容端點 — 包括本機模型。',
+        footer_built: '以 <a href="https://github.com/ggerganov/whisper.cpp" target="_blank">whisper.cpp</a> 與 Apple Metal 打造 · macOS 14+'
+      }
+    };
+
+    const langBtn = document.getElementById('lang-toggle');
+    let currentLang = 'en';
+
+    function applyLang(lang, persist = true) {
+      const dict = I18N[lang];
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        if (dict[key] !== undefined) el.innerHTML = dict[key];
+      });
+      document.documentElement.lang = lang === 'zh' ? 'zh-Hant' : 'en';
+      document.title = dict._title;
+      langBtn.textContent = lang === 'zh' ? 'EN' : '中文';
+      currentLang = lang;
+      // Shared ?lang= links shouldn't silently rewrite the visitor's saved
+      // preference, so only the explicit toggle click persists.
+      if (persist) { try { localStorage.setItem('whisperasr-lang', lang); } catch (e) {} }
+    }
+
+    // Precedence: ?lang= URL parameter > saved preference > browser locale.
+    const urlParam = (new URLSearchParams(location.search).get('lang') || '').toLowerCase();
+    const urlLang = urlParam.startsWith('zh') ? 'zh' : (urlParam === 'en' ? 'en' : null);
+    let saved = null;
+    try { saved = localStorage.getItem('whisperasr-lang'); } catch (e) {}
+    const initial = urlLang || saved || (((navigator.language || '').toLowerCase().startsWith('zh')) ? 'zh' : 'en');
+    if (initial !== 'en') applyLang(initial, false);
+
+    langBtn.addEventListener('click', () => applyLang(currentLang === 'en' ? 'zh' : 'en'));
   </script>
 
 </body>
